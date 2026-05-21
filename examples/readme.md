@@ -1,3 +1,3 @@
 # examples
 
-feature 0: `qwewginx -c examples/echo.conf` prints parsed ast (no server yet).
+feature 1: `cargo run -p qwewginx -- -c examples/echo.conf` then `curl http://127.0.0.1:8080/`

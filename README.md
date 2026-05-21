@@ -2,16 +2,17 @@
 
 nginx-ish reverse/forward proxy in rust. not suitable for production yet.
 
-right now it only **parses** a small nginx-style config and prints the ast.
+loads a small nginx-style config and serves http/1.1 `return` responses (single process).
 
 ## quick start
 
 ```bash
-cargo build
-./target/debug/qwewginx -c examples/echo.conf
+cargo run -p qwewginx -- -c examples/echo.conf
+# other terminal:
+curl http://127.0.0.1:8080/
 ```
 
-you should see a `Config { ... }` dump.
+debug ast only: `cargo run -p qwewginx -- -c examples/echo.conf --print-ast`
 
 ```bash
 cargo test

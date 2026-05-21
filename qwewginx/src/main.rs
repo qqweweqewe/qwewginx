@@ -30,8 +30,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // feature 0: default behavior is print ast (no server yet)
     info!("loaded {}", cli.config.display());
-    println!("{cfg:#?}");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(qwewginx_core::server::run(cfg))?;
     Ok(())
 }
