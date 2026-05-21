@@ -1,0 +1,9 @@
+[package]
+name = "qwewginx-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pest = "2.7"
+pest_derive = "2.7"
+thiserror = "2.0"

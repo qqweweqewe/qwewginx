@@ -1,0 +1,16 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
+
+file = { SOI ~ statement* ~ EOI }
+statement = { directive | block }
+
+block = { ident ~ block_open ~ statement* ~ "}" }
+block_open = { "{" | (arg ~ "{") }
+directive = { ident ~ arg+ ~ ";" }
+
+arg = { string | token }
+string = ${ "\"" ~ inner ~ "\"" }
+inner = @{ (!"\"" ~ ANY)* }
+token = @{ (ASCII_ALPHANUMERIC | "_" | "." | "/" | ":" | "-" | "$")+ }
+
+ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
