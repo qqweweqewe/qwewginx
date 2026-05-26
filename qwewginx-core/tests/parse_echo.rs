@@ -10,7 +10,8 @@ fn parse_echo_conf() {
     assert_eq!(cfg.events.worker_connections, 1024);
     assert_eq!(cfg.http.servers.len(), 1);
     let srv = &cfg.http.servers[0];
-    assert_eq!(srv.listen.len(), 1);
+    assert_eq!(srv.listeners.len(), 1);
+    assert!(!srv.listeners[0].ssl);
     assert_eq!(srv.locations.len(), 1);
     assert_eq!(srv.locations[0].path, "/");
     assert_eq!(srv.locations[0].ret.status, 200);

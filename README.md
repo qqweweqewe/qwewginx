@@ -2,7 +2,7 @@
 
 nginx-ish reverse/forward proxy in rust. not suitable for production yet.
 
-loads a small nginx-style config and serves `return` responses over http/1.1 and h2c (tls + alpn in a later feature). master spawns `worker_processes` workers (reuseport on linux).
+loads a small nginx-style config and serves `return` responses over http/1.1, h2c, and tls (alpn h2 + http/1.1). master spawns `worker_processes` workers (reuseport on linux).
 
 ## quick start
 
@@ -24,11 +24,8 @@ cargo test
 qwewginx/        # binary
 qwewginx-core/   # config parser + (later) server/proxy stuff
 examples/        # sample .conf files
-doc/GUIDE.md     # full spec
-doc/ROADMAP.md   # feature order for agents/humans
 ```
 
 ## config
 
-nginx-like dsl. see `examples/echo.conf`, `examples/routing.conf`, `examples/workers.conf`, `examples/h2.conf`.
-
+nginx-like dsl. see `examples/*.conf` (`tls.conf` needs `sh examples/tls/gen-certs.sh` first). static files — feature 7 in `doc/ROADMAP.md`.

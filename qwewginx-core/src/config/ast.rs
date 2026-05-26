@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -19,8 +20,21 @@ pub struct Http {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
-    pub listen: Vec<SocketAddr>,
+    pub listeners: Vec<Listen>,
+    pub tls: Option<TlsFiles>,
     pub locations: Vec<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listen {
+    pub addr: SocketAddr,
+    pub ssl: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

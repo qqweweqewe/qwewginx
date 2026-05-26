@@ -1,5 +1,6 @@
 mod error;
 mod listen;
+mod tls;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -22,14 +23,23 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
 
     for server in &cfg.http.servers {
         let srv = Arc::new(server.clone());
-        for addr in &server.listen {
-            let listener = listen::bind_reuseport(*addr).await?;
+        let tls_acceptor = match &server.tls {
+            Some(files) => Some(tls::TlsAcceptorHandle::load(&files.cert, &files.key)?),
+            None => None,
+        };
+
+        for endpoint in &server.listeners {
+            let listener = listen::bind_reuseport(endpoint.addr).await?;
+            let scheme = if endpoint.ssl { "https" } else { "http" };
             tracing::info!(
-                "worker {} listening on http://{addr} (http/1.1 + h2c)",
-                std::process::id()
+                "worker {} listening on {scheme}://{} (http/1.1 + h2)",
+                std::process::id(),
+                endpoint.addr
             );
             let srv = Arc::clone(&srv);
             let conn_builder = conn_builder.clone();
+            let tls_acceptor = tls_acceptor.clone();
+            let ssl = endpoint.ssl;
             n += 1;
 
             tokio::spawn(async move {
@@ -41,19 +51,43 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                             continue;
                         }
                     };
-                    let io = TokioIo::new(stream);
                     let srv = Arc::clone(&srv);
                     let conn_builder = conn_builder.clone();
-                    tokio::spawn(async move {
-                        let svc = service_fn(move |req| {
-                            let srv = Arc::clone(&srv);
-                            async move { Ok::<_, Infallible>(handle(req, &srv)) }
+                    if ssl {
+                        let acceptor = tls_acceptor
+                            .as_ref()
+                            .expect("ssl listener needs tls config")
+                            .clone();
+                        tokio::spawn(async move {
+                            let Ok(tls_stream) = acceptor.inner.accept(stream).await else {
+                                tracing::debug!("tls handshake failed");
+                                return;
+                            };
+                            let io = TokioIo::new(tls_stream);
+                            let svc = service_fn(move |req| {
+                                let srv = Arc::clone(&srv);
+                                async move { Ok::<_, Infallible>(handle(req, &srv)) }
+                            });
+                            if let Err(e) =
+                                conn_builder.serve_connection_with_upgrades(io, svc).await
+                            {
+                                tracing::debug!("connection closed: {e}");
+                            }
                         });
-                        if let Err(e) = conn_builder.serve_connection_with_upgrades(io, svc).await
-                        {
-                            tracing::debug!("connection closed: {e}");
-                        }
-                    });
+                    } else {
+                        let io = TokioIo::new(stream);
+                        tokio::spawn(async move {
+                            let svc = service_fn(move |req| {
+                                let srv = Arc::clone(&srv);
+                                async move { Ok::<_, Infallible>(handle(req, &srv)) }
+                            });
+                            if let Err(e) =
+                                conn_builder.serve_connection_with_upgrades(io, svc).await
+                            {
+                                tracing::debug!("connection closed: {e}");
+                            }
+                        });
+                    }
                 }
             });
         }

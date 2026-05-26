@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pest::Parser;
 use pest_derive::Parser;
@@ -132,7 +132,9 @@ fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http,
 }
 
 fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Server, ConfigError> {
-    let mut listen = Vec::new();
+    let mut listeners = Vec::new();
+    let mut cert_path = None;
+    let mut key_path = None;
     let mut locations = Vec::new();
 
     for stmt in stmts {
@@ -145,13 +147,24 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
                 let mut inner = item.into_inner();
                 let name = inner.next().unwrap().as_str();
                 let args: Vec<String> = inner.map(arg_to_string).collect();
-                if name == "listen" {
-                    let addr = one_string(&args, "listen")?;
-                    listen.push(parse_listen(&addr)?);
-                } else {
-                    return Err(ConfigError::Msg(format!(
-                        "unknown server directive: {name}"
-                    )));
+                match name {
+                    "listen" => {
+                        if args.is_empty() {
+                            return Err(ConfigError::Msg("listen needs an address".into()));
+                        }
+                        listeners.push(parse_listen_args(&args)?);
+                    }
+                    "ssl_certificate" => {
+                        cert_path = Some(PathBuf::from(one_string(&args, "ssl_certificate")?));
+                    }
+                    "ssl_certificate_key" => {
+                        key_path = Some(PathBuf::from(one_string(&args, "ssl_certificate_key")?));
+                    }
+                    other => {
+                        return Err(ConfigError::Msg(format!(
+                            "unknown server directive: {other}"
+                        )));
+                    }
                 }
             }
             Rule::block => {
@@ -167,11 +180,31 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
         }
     }
 
-    if listen.is_empty() {
+    if listeners.is_empty() {
         return Err(ConfigError::Msg("server needs listen".into()));
     }
 
-    Ok(Server { listen, locations })
+    let tls = match (cert_path, key_path) {
+        (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
+        (None, None) => None,
+        _ => {
+            return Err(ConfigError::Msg(
+                "ssl_certificate and ssl_certificate_key must both be set".into(),
+            ));
+        }
+    };
+
+    if listeners.iter().any(|l| l.ssl) && tls.is_none() {
+        return Err(ConfigError::Msg(
+            "ssl listen needs ssl_certificate and ssl_certificate_key".into(),
+        ));
+    }
+
+    Ok(Server {
+        listeners,
+        tls,
+        locations,
+    })
 }
 
 fn parse_location_block(
@@ -210,7 +243,28 @@ fn parse_location_block(
     Ok(Location { path, ret })
 }
 
-fn parse_listen(s: &str) -> Result<SocketAddr, ConfigError> {
+fn parse_listen_args(args: &[String]) -> Result<Listen, ConfigError> {
+    let mut ssl = false;
+    let mut addr_part = None;
+    for arg in args {
+        if arg == "ssl" {
+            ssl = true;
+        } else if addr_part.is_none() {
+            addr_part = Some(arg.as_str());
+        } else {
+            return Err(ConfigError::Msg(format!(
+                "unexpected listen argument: {arg}"
+            )));
+        }
+    }
+    let addr_part = addr_part.ok_or_else(|| ConfigError::Msg("listen needs an address".into()))?;
+    Ok(Listen {
+        addr: parse_listen_addr(addr_part)?,
+        ssl,
+    })
+}
+
+fn parse_listen_addr(s: &str) -> Result<SocketAddr, ConfigError> {
     // 127.0.0.1:8080 or :8080
     let addr = if s.starts_with(':') {
         format!("127.0.0.1{s}")

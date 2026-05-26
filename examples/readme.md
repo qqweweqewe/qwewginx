@@ -19,4 +19,12 @@ curl --http2 http://127.0.0.1:9092/    # h2c upgrade from http/1.1
 curl http://127.0.0.1:9092/            # plain http/1.1 still works
 ```
 
-alpn h2 over tls lands in feature 5.
+feature 5 — tls: generate certs once, then:
+
+```bash
+sh examples/tls/gen-certs.sh
+cargo run -p qwewginx -- -c examples/tls.conf
+curl -k https://127.0.0.1:443/
+curl -k --http2 https://127.0.0.1:443/
+curl http://127.0.0.1:80/   # same conf, plain server block
+```
