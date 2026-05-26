@@ -2,14 +2,14 @@
 
 nginx-ish reverse/forward proxy in rust. not suitable for production yet.
 
-loads a small nginx-style config and serves http/1.1 `return` responses (single process).
+loads a small nginx-style config and serves http/1.1 `return` responses. master spawns `worker_processes` workers (reuseport on linux).
 
 ## quick start
 
 ```bash
 cargo run -p qwewginx -- -c examples/echo.conf
 # other terminal:
-curl http://127.0.0.1:8080/
+curl http://127.0.0.1:9090/
 ```
 
 debug ast only: `cargo run -p qwewginx -- -c examples/echo.conf --print-ast`
@@ -30,5 +30,5 @@ doc/ROADMAP.md   # feature order for agents/humans
 
 ## config
 
-nginx-like dsl. see `examples/echo.conf` and `examples/routing.conf`.
+nginx-like dsl. see `examples/echo.conf`, `examples/routing.conf`, `examples/workers.conf`.
 

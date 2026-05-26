@@ -1,4 +1,5 @@
 mod error;
+mod listen;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -10,7 +11,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
 
 pub use error::ServerError;
 
@@ -22,8 +22,11 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
     for server in &cfg.http.servers {
         let srv = Arc::new(server.clone());
         for addr in &server.listen {
-            let listener = TcpListener::bind(*addr).await?;
-            tracing::info!("listening on http://{addr}");
+            let listener = listen::bind_reuseport(*addr).await?;
+            tracing::info!(
+                "worker {} listening on http://{addr}",
+                std::process::id()
+            );
             let srv = Arc::clone(&srv);
             n += 1;
 
