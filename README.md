@@ -2,7 +2,7 @@
 
 nginx-ish reverse/forward proxy in rust. not suitable for production yet.
 
-loads a small nginx-style config and serves http/1.1 `return` responses. master spawns `worker_processes` workers (reuseport on linux).
+loads a small nginx-style config and serves `return` responses over http/1.1 and h2c (tls + alpn in a later feature). master spawns `worker_processes` workers (reuseport on linux).
 
 ## quick start
 
@@ -30,5 +30,5 @@ doc/ROADMAP.md   # feature order for agents/humans
 
 ## config
 
-nginx-like dsl. see `examples/echo.conf`, `examples/routing.conf`, `examples/workers.conf`.
+nginx-like dsl. see `examples/echo.conf`, `examples/routing.conf`, `examples/workers.conf`, `examples/h2.conf`.
 
