@@ -30,5 +30,5 @@ doc/ROADMAP.md   # feature order for agents/humans
 
 ## config
 
-nginx-like dsl. see `examples/echo.conf` for what's supported today.
+nginx-like dsl. see `examples/echo.conf` and `examples/routing.conf`.
 
