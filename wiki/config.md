@@ -26,6 +26,7 @@ http {
         location / {
             return 200 "hello\n";
             # OR: proxy_pass http://backend;
+            # OR: root examples/static;
         }
     }
 }
@@ -50,6 +51,8 @@ http {
 | `location /path { ... }`         | server   | prefix match, see routing               |
 | `return STATUS "body"`           | location | synthetic response, text/plain          |
 | `proxy_pass http://...`          | location | reverse proxy, see below                |
+| `root path`                      | location | document root for static files          |
+| `index file ...`                 | location | index filenames (default `index.html`)  |
 
 
 unknown directive = parse error.
@@ -88,6 +91,26 @@ proxy_pass http://127.0.0.1:9091;    # direct
 
 ---
 
+## static files
+
+```nginx
+location / {
+    root examples/static;
+    index index.html;
+}
+```
+
+- **GET/HEAD only** — other methods → **405**
+- maps request uri under `root` (longest-prefix location applies)
+- directory or missing file → tries `index` files in order
+- `..` in path → **403** `forbidden\n`
+- missing file → **404** `not found\n`
+- content-type from file extension
+- paths relative to **cwd** where you start qwewginx (run from repo root for examples)
+- no `try_files`, no autoindex, no `alias`
+
+---
+
 ## tls dev certs
 
 ```bash
@@ -102,6 +125,6 @@ ports 80/443 need root or `setcap` — use high ports in dev.
 
 ## not supported (yet)
 
-`root`, `stream {}`, forward proxy, CONNECT, access_log, plugins, config reload, graceful drain.
+`stream {}`, forward proxy, CONNECT, access_log, plugins, config reload, graceful drain.
 
 see [features.md](features.md) for roadmap-ish list.

@@ -47,3 +47,11 @@ cargo run -p qwewginx -- -c examples/proxy-tls.conf  # terminal 2 — :9443 (443
 curl -k https://127.0.0.1:9443/
 curl -k --http2 https://127.0.0.1:9443/
 ```
+
+feature 7 — static files (run from repo root):
+
+```bash
+cargo run -p qwewginx -- -c examples/static.conf
+curl http://127.0.0.1:9090/
+curl http://127.0.0.1:9090/style.css
+```

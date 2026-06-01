@@ -54,6 +54,13 @@ pub struct Location {
 pub enum LocationAction {
     Return(ReturnDirective),
     ProxyPass(ProxyPass),
+    Static(StaticFiles),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticFiles {
+    pub root: PathBuf,
+    pub index: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

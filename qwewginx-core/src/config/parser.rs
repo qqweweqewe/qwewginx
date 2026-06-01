@@ -262,6 +262,8 @@ fn parse_location_block(
 ) -> Result<Location, ConfigError> {
     let mut ret = None;
     let mut proxy_pass = None;
+    let mut root = None;
+    let mut index = Vec::new();
     for stmt in stmts {
         if stmt.as_rule() != Rule::statement {
             continue;
@@ -273,7 +275,7 @@ fn parse_location_block(
             let args: Vec<String> = inner.map(arg_to_string).collect();
             match name {
                 "return" => {
-                    if ret.is_some() || proxy_pass.is_some() {
+                    if ret.is_some() || proxy_pass.is_some() || root.is_some() {
                         return Err(ConfigError::Msg(format!(
                             "location {path} has duplicate action"
                         )));
@@ -290,13 +292,37 @@ fn parse_location_block(
                     ret = Some(ReturnDirective { status, body });
                 }
                 "proxy_pass" => {
-                    if ret.is_some() || proxy_pass.is_some() {
+                    if ret.is_some() || proxy_pass.is_some() || root.is_some() {
                         return Err(ConfigError::Msg(format!(
                             "location {path} has duplicate action"
                         )));
                     }
                     let url = one_string(&args, "proxy_pass")?;
                     proxy_pass = Some(parse_proxy_pass(&url)?);
+                }
+                "root" => {
+                    if ret.is_some() || proxy_pass.is_some() || root.is_some() {
+                        return Err(ConfigError::Msg(format!(
+                            "location {path} has duplicate action"
+                        )));
+                    }
+                    root = Some(PathBuf::from(one_string(&args, "root")?));
+                }
+                "index" => {
+                    if root.is_none() && ret.is_none() && proxy_pass.is_none() {
+                        return Err(ConfigError::Msg(format!(
+                            "location {path}: index requires root"
+                        )));
+                    }
+                    if ret.is_some() || proxy_pass.is_some() {
+                        return Err(ConfigError::Msg(format!(
+                            "location {path} has duplicate action"
+                        )));
+                    }
+                    if args.is_empty() {
+                        return Err(ConfigError::Msg("index needs at least one filename".into()));
+                    }
+                    index.extend(args);
                 }
                 other => {
                     return Err(ConfigError::Msg(format!(
@@ -306,15 +332,25 @@ fn parse_location_block(
             }
         }
     }
-    let action = match (ret, proxy_pass) {
-        (Some(r), None) => LocationAction::Return(r),
-        (None, Some(p)) => LocationAction::ProxyPass(p),
-        (None, None) => {
+    let action = match (ret, proxy_pass, root) {
+        (Some(r), None, None) => LocationAction::Return(r),
+        (None, Some(p), None) => LocationAction::ProxyPass(p),
+        (None, None, Some(root_path)) => {
+            if index.is_empty() {
+                index.push("index.html".into());
+            }
+            LocationAction::Static(StaticFiles { root: root_path, index })
+        }
+        (None, None, None) => {
             return Err(ConfigError::Msg(format!(
-                "location {path} needs return or proxy_pass"
+                "location {path} needs return, proxy_pass, or root"
             )));
         }
-        (Some(_), Some(_)) => unreachable!(),
+        _ => {
+            return Err(ConfigError::Msg(format!(
+                "location {path} has conflicting directives"
+            )));
+        }
     };
     Ok(Location { path, action })
 }

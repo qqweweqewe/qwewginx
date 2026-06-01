@@ -2,7 +2,7 @@
 
 pet-project nginx-ish proxy in rust. **not production-ready.**
 
-shipped through **feature 6** (reverse proxy). next: static files.
+shipped through **feature 7** (static files). next: upstream lb + health.
 
 ## quick start
 

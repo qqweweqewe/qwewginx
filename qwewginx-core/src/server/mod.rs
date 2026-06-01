@@ -1,6 +1,7 @@
 mod error;
 mod listen;
 mod proxy;
+mod static_files;
 mod tls;
 
 use std::convert::Infallible;
@@ -113,9 +114,12 @@ async fn handle(
     http_ctx: &WorkerHttp,
 ) -> Response<ResponseBody> {
     let path = req.uri().path();
-    match match_location(path, &server.locations) {
-        Some(LocationAction::Return(ret)) => return_response(ret),
-        Some(LocationAction::ProxyPass(pass)) => {
+    let Some(loc) = match_location(path, &server.locations) else {
+        return not_found();
+    };
+    match &loc.action {
+        LocationAction::Return(ret) => return_response(ret),
+        LocationAction::ProxyPass(pass) => {
             match resolve_target(&pass.target, &http_ctx.upstreams) {
                 Some(upstream) => proxy::forward(&http_ctx.client, req, upstream).await,
                 None => {
@@ -124,7 +128,9 @@ async fn handle(
                 }
             }
         }
-        None => not_found(),
+        LocationAction::Static(cfg) => {
+            static_files::serve(req.method(), path, &loc.path, cfg).await
+        }
     }
 }
 
@@ -138,12 +144,11 @@ fn location_prefix_matches(path: &str, prefix: &str) -> bool {
             && path.as_bytes()[prefix.len()] == b'/')
 }
 
-fn match_location<'a>(path: &str, locations: &'a [Location]) -> Option<&'a LocationAction> {
+fn match_location<'a>(path: &str, locations: &'a [Location]) -> Option<&'a Location> {
     locations
         .iter()
         .filter(|loc| location_prefix_matches(path, &loc.path))
         .max_by_key(|loc| loc.path.len())
-        .map(|loc| &loc.action)
 }
 
 #[cfg(test)]
@@ -166,9 +171,9 @@ mod tests {
     }
 
     fn match_return<'a>(path: &str, locations: &'a [Location]) -> Option<&'a ReturnDirective> {
-        match match_location(path, locations)? {
+        match match_location(path, locations).map(|l| &l.action)? {
             LocationAction::Return(r) => Some(r),
-            LocationAction::ProxyPass(_) => None,
+            LocationAction::ProxyPass(_) | LocationAction::Static(_) => None,
         }
     }
 
