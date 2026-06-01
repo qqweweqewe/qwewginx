@@ -111,14 +111,59 @@ fn handle(req: Request<Incoming>, server: &Server) -> Response<Full<Bytes>> {
     }
 }
 
+fn location_prefix_matches(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
+}
+
 fn match_location<'a>(path: &str, locations: &'a [Location]) -> Option<&'a ReturnDirective> {
-    // feature 2: longest prefix
-    for loc in locations {
-        if path.starts_with(&loc.path) {
-            return Some(&loc.ret);
+    locations
+        .iter()
+        .filter(|loc| location_prefix_matches(path, &loc.path))
+        .max_by_key(|loc| loc.path.len())
+        .map(|loc| &loc.ret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ReturnDirective;
+
+    fn loc(path: &str, body: &str) -> Location {
+        Location {
+            path: path.into(),
+            ret: ReturnDirective {
+                status: 200,
+                body: body.into(),
+            },
         }
     }
-    None
+
+    fn routing_locations() -> Vec<Location> {
+        vec![loc("/", "root\n"), loc("/api", "api\n"), loc("/api/v1", "api v1\n")]
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let locations = routing_locations();
+        assert_eq!(match_location("/api/v1/x", &locations).unwrap().body, "api v1\n");
+        assert_eq!(match_location("/api/other", &locations).unwrap().body, "api\n");
+        assert_eq!(match_location("/", &locations).unwrap().body, "root\n");
+        assert_eq!(match_location("/stuff", &locations).unwrap().body, "root\n");
+    }
+
+    #[test]
+    fn prefix_boundary() {
+        let locations = vec![loc("/api", "api\n")];
+        assert!(match_location("/apifoo", &locations).is_none());
+        assert_eq!(match_location("/api", &locations).unwrap().body, "api\n");
+        assert_eq!(match_location("/api/foo", &locations).unwrap().body, "api\n");
+    }
 }
 
 fn return_response(ret: &ReturnDirective) -> Response<Full<Bytes>> {
