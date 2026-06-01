@@ -7,16 +7,16 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
-use hyper::header::HOST;
-use hyper::http::uri::{Scheme, Uri};
-use hyper::{Request, Response, StatusCode};
+use hyper::header::{HeaderValue, HOST};
+use hyper::http::uri::Uri;
+use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::config::{Http, ProxyTarget};
 
-pub type HttpClient = Client<HttpConnector, Incoming>;
+pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
 pub struct WorkerHttp {
@@ -53,15 +53,25 @@ pub fn resolve_target(
 }
 
 pub fn build_upstream_uri(addr: SocketAddr, req_uri: &Uri) -> Option<Uri> {
-    let mut parts = req_uri.clone().into_parts();
-    parts.scheme = Some(Scheme::HTTP);
+    let pq = req_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
     let authority = if addr.port() == 80 {
         addr.ip().to_string()
     } else {
         addr.to_string()
     };
-    parts.authority = Some(authority.parse().ok()?);
-    Uri::from_parts(parts).ok()
+    format!("http://{authority}{pq}").parse().ok()
+}
+
+fn hop_by_hop(name: &hyper::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection" | "keep-alive" | "proxy-connection" | "te" | "trailer"
+            | "transfer-encoding" | "upgrade"
+    ) || name.as_str().starts_with(':')
 }
 
 pub async fn forward(
@@ -69,30 +79,48 @@ pub async fn forward(
     req: Request<Incoming>,
     upstream: SocketAddr,
 ) -> Response<ResponseBody> {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     let uri = match build_upstream_uri(upstream, &parts.uri) {
         Some(u) => u,
-        None => {
-            tracing::debug!("bad upstream uri");
+        None => return bad_gateway(),
+    };
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            tracing::debug!("proxy body read failed: {e}");
             return bad_gateway();
         }
     };
-    parts.uri = uri;
-    if !parts.headers.contains_key(HOST) {
-        let host = if upstream.port() == 80 {
-            upstream.ip().to_string()
-        } else {
-            upstream.to_string()
-        };
-        if let Ok(v) = host.parse() {
-            parts.headers.insert(HOST, v);
+    let host = if upstream.port() == 80 {
+        upstream.ip().to_string()
+    } else {
+        upstream.to_string()
+    };
+    let host: HeaderValue = host.parse().expect("host is valid header value");
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(uri)
+        .version(Version::HTTP_11)
+        .header(HOST, host);
+    for (name, value) in parts.headers.iter() {
+        if hop_by_hop(name) || *name == HOST {
+            continue;
         }
+        builder = builder.header(name, value);
     }
-    let upstream_req = Request::from_parts(parts, body);
+    let mut upstream_req = match builder.body(Full::new(body_bytes)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("proxy request build failed: {e}");
+            return bad_gateway();
+        }
+    };
+    *upstream_req.version_mut() = Version::HTTP_11;
+    upstream_req.extensions_mut().clear();
     match client.request(upstream_req).await {
         Ok(resp) => resp.map(|b| b.boxed()),
         Err(e) => {
-            tracing::debug!("proxy failed: {e}");
+            tracing::debug!("proxy upstream failed: {e}");
             bad_gateway()
         }
     }
@@ -133,6 +161,24 @@ mod tests {
             ),
             Some("127.0.0.1:9091".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn build_uri_from_path_only() {
+        let addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let uri: Uri = "/".parse().unwrap();
+        let out = build_upstream_uri(addr, &uri).expect("uri");
+        assert_eq!(out.to_string(), "http://127.0.0.1:9091/");
+    }
+
+    #[test]
+    fn build_uri_from_absolute_https() {
+        let addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let uri: Uri = "https://127.0.0.1:9443/".parse().unwrap();
+        let out = build_upstream_uri(addr, &uri).expect("uri");
+        assert_eq!(out.path(), "/");
+        assert_eq!(out.authority().unwrap().host(), "127.0.0.1");
+        assert_eq!(out.authority().unwrap().port_u16(), Some(9091));
     }
 
     #[test]

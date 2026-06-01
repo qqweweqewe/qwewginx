@@ -37,3 +37,13 @@ cargo run -p qwewginx -- -c examples/proxy.conf     # terminal 2 — :9090
 curl http://127.0.0.1:9090/                         # backend body via proxy
 # stop backend → curl gets 502 bad gateway
 ```
+
+feature 6 + tls — proxy with tls front door (backend stays plain http):
+
+```bash
+sh examples/tls/gen-certs.sh   # once
+cargo run -p qwewginx -- -c examples/backend.conf    # terminal 1 — :9091
+cargo run -p qwewginx -- -c examples/proxy-tls.conf  # terminal 2 — :9443 (443 needs root/setcap)
+curl -k https://127.0.0.1:9443/
+curl -k --http2 https://127.0.0.1:9443/
+```
