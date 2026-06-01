@@ -28,3 +28,12 @@ curl -k https://127.0.0.1:443/
 curl -k --http2 https://127.0.0.1:443/
 curl http://127.0.0.1:80/   # same conf, plain server block
 ```
+
+feature 6 — reverse proxy: start backend, then proxy:
+
+```bash
+cargo run -p qwewginx -- -c examples/backend.conf   # terminal 1 — :9091
+cargo run -p qwewginx -- -c examples/proxy.conf     # terminal 2 — :9090
+curl http://127.0.0.1:9090/                         # backend body via proxy
+# stop backend → curl gets 502 bad gateway
+```

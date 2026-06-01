@@ -25,6 +25,7 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
         worker_connections: 1024,
     };
     let mut http = Http {
+        upstreams: Vec::new(),
         servers: Vec::new(),
     };
 
@@ -112,6 +113,7 @@ fn parse_events_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Eve
 }
 
 fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http, ConfigError> {
+    let mut upstreams = Vec::new();
     let mut servers = Vec::new();
     for stmt in stmts {
         if stmt.as_rule() != Rule::statement {
@@ -121,14 +123,61 @@ fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http,
         if let Rule::block = item.as_rule() {
             let mut inner = item.into_inner();
             let name = inner.next().unwrap().as_str();
-            if name != "server" {
-                return Err(ConfigError::Msg(format!("unknown http block: {name}")));
+            let (block_name, inner_stmts) = split_block_open(inner)?;
+            match name {
+                "server" => {
+                    servers.push(parse_server_block(inner_stmts)?);
+                }
+                "upstream" => {
+                    let upstream_name = block_name.ok_or_else(|| {
+                        ConfigError::Msg("upstream needs a name".into())
+                    })?;
+                    if upstreams.iter().any(|u: &Upstream| u.name == upstream_name) {
+                        return Err(ConfigError::Msg(format!(
+                            "duplicate upstream: {upstream_name}"
+                        )));
+                    }
+                    upstreams.push(parse_upstream_block(upstream_name, inner_stmts)?);
+                }
+                other => {
+                    return Err(ConfigError::Msg(format!("unknown http block: {other}")));
+                }
             }
-            let (_open, inner_stmts) = split_block_open(inner)?;
-            servers.push(parse_server_block(inner_stmts)?);
         }
     }
-    Ok(Http { servers })
+    Ok(Http { upstreams, servers })
+}
+
+fn parse_upstream_block(
+    name: String,
+    stmts: Vec<pest::iterators::Pair<'_, Rule>>,
+) -> Result<Upstream, ConfigError> {
+    let mut servers = Vec::new();
+    for stmt in stmts {
+        if stmt.as_rule() != Rule::statement {
+            continue;
+        }
+        let d = stmt.into_inner().next().unwrap();
+        if let Rule::directive = d.as_rule() {
+            let mut inner = d.into_inner();
+            let dir = inner.next().unwrap().as_str();
+            let args: Vec<String> = inner.map(arg_to_string).collect();
+            if dir == "server" {
+                let addr = args
+                    .first()
+                    .ok_or_else(|| ConfigError::Msg("server needs an address".into()))?;
+                servers.push(parse_listen_addr(addr)?);
+            } else {
+                return Err(ConfigError::Msg(format!(
+                    "unknown upstream directive: {dir}"
+                )));
+            }
+        }
+    }
+    if servers.is_empty() {
+        return Err(ConfigError::Msg(format!("upstream {name} needs server")));
+    }
+    Ok(Upstream { name, servers })
 }
 
 fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Server, ConfigError> {
@@ -212,6 +261,7 @@ fn parse_location_block(
     stmts: Vec<pest::iterators::Pair<'_, Rule>>,
 ) -> Result<Location, ConfigError> {
     let mut ret = None;
+    let mut proxy_pass = None;
     for stmt in stmts {
         if stmt.as_rule() != Rule::statement {
             continue;
@@ -221,26 +271,73 @@ fn parse_location_block(
             let mut inner = d.into_inner();
             let name = inner.next().unwrap().as_str();
             let args: Vec<String> = inner.map(arg_to_string).collect();
-            if name == "return" {
-                if args.len() < 2 {
-                    return Err(ConfigError::Msg(
-                        "return needs status and body string".into(),
-                    ));
+            match name {
+                "return" => {
+                    if ret.is_some() || proxy_pass.is_some() {
+                        return Err(ConfigError::Msg(format!(
+                            "location {path} has duplicate action"
+                        )));
+                    }
+                    if args.len() < 2 {
+                        return Err(ConfigError::Msg(
+                            "return needs status and body string".into(),
+                        ));
+                    }
+                    let status: u16 = args[0]
+                        .parse()
+                        .map_err(|_| ConfigError::Msg("return status must be a number".into()))?;
+                    let body = args[1].clone();
+                    ret = Some(ReturnDirective { status, body });
                 }
-                let status: u16 = args[0]
-                    .parse()
-                    .map_err(|_| ConfigError::Msg("return status must be a number".into()))?;
-                let body = args[1].clone();
-                ret = Some(ReturnDirective { status, body });
-            } else {
-                return Err(ConfigError::Msg(format!(
-                    "unknown location directive: {name}"
-                )));
+                "proxy_pass" => {
+                    if ret.is_some() || proxy_pass.is_some() {
+                        return Err(ConfigError::Msg(format!(
+                            "location {path} has duplicate action"
+                        )));
+                    }
+                    let url = one_string(&args, "proxy_pass")?;
+                    proxy_pass = Some(parse_proxy_pass(&url)?);
+                }
+                other => {
+                    return Err(ConfigError::Msg(format!(
+                        "unknown location directive: {other}"
+                    )));
+                }
             }
         }
     }
-    let ret = ret.ok_or_else(|| ConfigError::Msg(format!("location {path} needs return")))?;
-    Ok(Location { path, ret })
+    let action = match (ret, proxy_pass) {
+        (Some(r), None) => LocationAction::Return(r),
+        (None, Some(p)) => LocationAction::ProxyPass(p),
+        (None, None) => {
+            return Err(ConfigError::Msg(format!(
+                "location {path} needs return or proxy_pass"
+            )));
+        }
+        (Some(_), Some(_)) => unreachable!(),
+    };
+    Ok(Location { path, action })
+}
+
+fn parse_proxy_pass(url: &str) -> Result<ProxyPass, ConfigError> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| ConfigError::Msg("proxy_pass only supports http:// in v1".into()))?;
+    if rest.is_empty() {
+        return Err(ConfigError::Msg("proxy_pass needs a target".into()));
+    }
+    if rest.contains('/') {
+        return Err(ConfigError::Msg(
+            "proxy_pass uri path not supported in v1".into(),
+        ));
+    }
+    let target = if rest.contains(':') {
+        let addr = parse_listen_addr(rest)?;
+        ProxyTarget::Direct(addr)
+    } else {
+        ProxyTarget::Upstream(rest.to_string())
+    };
+    Ok(ProxyPass { target })
 }
 
 fn parse_listen_args(args: &[String]) -> Result<Listen, ConfigError> {

@@ -15,7 +15,14 @@ pub struct Events {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Http {
+    pub upstreams: Vec<Upstream>,
     pub servers: Vec<Server>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    pub name: String,
+    pub servers: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +47,28 @@ pub struct TlsFiles {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub path: String,
-    pub ret: ReturnDirective,
+    pub action: LocationAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocationAction {
+    Return(ReturnDirective),
+    ProxyPass(ProxyPass),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnDirective {
     pub status: u16,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPass {
+    pub target: ProxyTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyTarget {
+    Upstream(String),
+    Direct(SocketAddr),
 }

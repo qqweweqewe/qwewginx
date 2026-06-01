@@ -1,12 +1,13 @@
 mod error;
 mod listen;
+mod proxy;
 mod tls;
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -15,10 +16,12 @@ use hyper_util::server::conn::auto;
 
 pub use error::ServerError;
 
-use crate::config::{Config, Location, ReturnDirective, Server};
+use crate::config::{Config, Location, LocationAction, ReturnDirective, Server};
+use proxy::{resolve_target, ResponseBody, WorkerHttp};
 
 pub async fn run(cfg: Config) -> Result<(), ServerError> {
     let conn_builder = auto::Builder::new(TokioExecutor::new());
+    let http_ctx = proxy::worker_http_arc(&cfg.http);
     let mut n = 0;
 
     for server in &cfg.http.servers {
@@ -37,6 +40,7 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                 endpoint.addr
             );
             let srv = Arc::clone(&srv);
+            let http_ctx = Arc::clone(&http_ctx);
             let conn_builder = conn_builder.clone();
             let tls_acceptor = tls_acceptor.clone();
             let ssl = endpoint.ssl;
@@ -52,6 +56,7 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                         }
                     };
                     let srv = Arc::clone(&srv);
+                    let http_ctx = Arc::clone(&http_ctx);
                     let conn_builder = conn_builder.clone();
                     if ssl {
                         let acceptor = tls_acceptor
@@ -66,7 +71,8 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                             let io = TokioIo::new(tls_stream);
                             let svc = service_fn(move |req| {
                                 let srv = Arc::clone(&srv);
-                                async move { Ok::<_, Infallible>(handle(req, &srv)) }
+                                let http_ctx = Arc::clone(&http_ctx);
+                                async move { Ok::<_, Infallible>(handle(req, &srv, &http_ctx).await) }
                             });
                             if let Err(e) =
                                 conn_builder.serve_connection_with_upgrades(io, svc).await
@@ -79,7 +85,8 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                         tokio::spawn(async move {
                             let svc = service_fn(move |req| {
                                 let srv = Arc::clone(&srv);
-                                async move { Ok::<_, Infallible>(handle(req, &srv)) }
+                                let http_ctx = Arc::clone(&http_ctx);
+                                async move { Ok::<_, Infallible>(handle(req, &srv, &http_ctx).await) }
                             });
                             if let Err(e) =
                                 conn_builder.serve_connection_with_upgrades(io, svc).await
@@ -100,14 +107,24 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
     std::future::pending().await
 }
 
-fn handle(req: Request<Incoming>, server: &Server) -> Response<Full<Bytes>> {
+async fn handle(
+    req: Request<Incoming>,
+    server: &Server,
+    http_ctx: &WorkerHttp,
+) -> Response<ResponseBody> {
     let path = req.uri().path();
     match match_location(path, &server.locations) {
-        Some(ret) => return_response(ret),
-        None => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from("not found\n")))
-            .unwrap(),
+        Some(LocationAction::Return(ret)) => return_response(ret),
+        Some(LocationAction::ProxyPass(pass)) => {
+            match resolve_target(&pass.target, &http_ctx.upstreams) {
+                Some(upstream) => proxy::forward(&http_ctx.client, req, upstream).await,
+                None => {
+                    tracing::debug!("unknown upstream for proxy_pass");
+                    proxy::bad_gateway_response()
+                }
+            }
+        }
+        None => not_found(),
     }
 }
 
@@ -121,12 +138,12 @@ fn location_prefix_matches(path: &str, prefix: &str) -> bool {
             && path.as_bytes()[prefix.len()] == b'/')
 }
 
-fn match_location<'a>(path: &str, locations: &'a [Location]) -> Option<&'a ReturnDirective> {
+fn match_location<'a>(path: &str, locations: &'a [Location]) -> Option<&'a LocationAction> {
     locations
         .iter()
         .filter(|loc| location_prefix_matches(path, &loc.path))
         .max_by_key(|loc| loc.path.len())
-        .map(|loc| &loc.ret)
+        .map(|loc| &loc.action)
 }
 
 #[cfg(test)]
@@ -137,10 +154,10 @@ mod tests {
     fn loc(path: &str, body: &str) -> Location {
         Location {
             path: path.into(),
-            ret: ReturnDirective {
+            action: LocationAction::Return(ReturnDirective {
                 status: 200,
                 body: body.into(),
-            },
+            }),
         }
     }
 
@@ -148,30 +165,55 @@ mod tests {
         vec![loc("/", "root\n"), loc("/api", "api\n"), loc("/api/v1", "api v1\n")]
     }
 
+    fn match_return<'a>(path: &str, locations: &'a [Location]) -> Option<&'a ReturnDirective> {
+        match match_location(path, locations)? {
+            LocationAction::Return(r) => Some(r),
+            LocationAction::ProxyPass(_) => None,
+        }
+    }
+
     #[test]
     fn longest_prefix_wins() {
         let locations = routing_locations();
-        assert_eq!(match_location("/api/v1/x", &locations).unwrap().body, "api v1\n");
-        assert_eq!(match_location("/api/other", &locations).unwrap().body, "api\n");
-        assert_eq!(match_location("/", &locations).unwrap().body, "root\n");
-        assert_eq!(match_location("/stuff", &locations).unwrap().body, "root\n");
+        assert_eq!(
+            match_return("/api/v1/x", &locations).unwrap().body,
+            "api v1\n"
+        );
+        assert_eq!(match_return("/api/other", &locations).unwrap().body, "api\n");
+        assert_eq!(match_return("/", &locations).unwrap().body, "root\n");
+        assert_eq!(match_return("/stuff", &locations).unwrap().body, "root\n");
     }
 
     #[test]
     fn prefix_boundary() {
         let locations = vec![loc("/api", "api\n")];
-        assert!(match_location("/apifoo", &locations).is_none());
-        assert_eq!(match_location("/api", &locations).unwrap().body, "api\n");
-        assert_eq!(match_location("/api/foo", &locations).unwrap().body, "api\n");
+        assert!(match_return("/apifoo", &locations).is_none());
+        assert_eq!(match_return("/api", &locations).unwrap().body, "api\n");
+        assert_eq!(match_return("/api/foo", &locations).unwrap().body, "api\n");
     }
 }
 
-fn return_response(ret: &ReturnDirective) -> Response<Full<Bytes>> {
+fn return_response(ret: &ReturnDirective) -> Response<ResponseBody> {
     let status =
         StatusCode::from_u16(ret.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(Full::new(Bytes::copy_from_slice(ret.body.as_bytes())))
+        .body(
+            Full::new(Bytes::copy_from_slice(ret.body.as_bytes()))
+                .map_err(|e: Infallible| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+fn not_found() -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(
+            Full::new(Bytes::from("not found\n"))
+                .map_err(|e: Infallible| match e {})
+                .boxed(),
+        )
         .unwrap()
 }

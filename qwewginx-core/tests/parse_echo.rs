@@ -14,6 +14,11 @@ fn parse_echo_conf() {
     assert!(!srv.listeners[0].ssl);
     assert_eq!(srv.locations.len(), 1);
     assert_eq!(srv.locations[0].path, "/");
-    assert_eq!(srv.locations[0].ret.status, 200);
-    assert_eq!(srv.locations[0].ret.body, "hello from qwewginx\n");
+    match &srv.locations[0].action {
+        qwewginx_core::config::LocationAction::Return(ret) => {
+            assert_eq!(ret.status, 200);
+            assert_eq!(ret.body, "hello from qwewginx\n");
+        }
+        _ => panic!("expected return"),
+    }
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use qwewginx_core::config::parse_file;
+use qwewginx_core::config::{parse_file, LocationAction};
 
 #[test]
 fn parse_tls_conf() {
@@ -14,7 +14,10 @@ fn parse_tls_conf() {
     assert_eq!(tls_srv.listeners[0].addr.port(), 443);
     let files = tls_srv.tls.as_ref().expect("tls files");
     assert!(files.cert.ends_with("examples/tls/cert.pem"));
-    assert_eq!(tls_srv.locations[0].ret.body, "hello from qwewginx tls\n");
+    match &tls_srv.locations[0].action {
+        LocationAction::Return(ret) => assert_eq!(ret.body, "hello from qwewginx tls\n"),
+        _ => panic!("expected return"),
+    }
 
     let plain = &cfg.http.servers[1];
     assert!(!plain.listeners[0].ssl);
