@@ -2,7 +2,7 @@
 
 pet-project nginx-ish proxy in rust. **not production-ready.**
 
-shipped through **feature 8** (upstream round-robin). next: upstream health.
+shipped through **feature 9** (passive upstream health). next: active health checks.
 
 ## quick start
 
@@ -11,7 +11,8 @@ cargo run -p qwewginx -- -c examples/echo.conf
 curl http://127.0.0.1:9090/
 ```
 
-debug parsed config: `--print-ast`
+debug parsed config: `--print-ast`  
+verbose logs: `-l debug` or `--log-level trace` (default `info`; `RUST_LOG` still works for other crates)
 
 ```bash
 cargo test

@@ -17,8 +17,8 @@ use hyper_util::server::conn::auto;
 
 pub use error::ServerError;
 
-use crate::config::{Config, Location, LocationAction, ReturnDirective, Server};
-use proxy::{resolve_target, ResponseBody, WorkerHttp};
+use crate::config::{Config, Location, LocationAction, ProxyTarget, ReturnDirective, Server};
+use proxy::{ResponseBody, WorkerHttp};
 
 pub async fn run(cfg: Config) -> Result<(), ServerError> {
     let conn_builder = auto::Builder::new(TokioExecutor::new());
@@ -119,15 +119,16 @@ async fn handle(
     };
     match &loc.action {
         LocationAction::Return(ret) => return_response(ret),
-        LocationAction::ProxyPass(pass) => {
-            match resolve_target(&pass.target, &http_ctx.upstreams) {
-                Some(upstream) => proxy::forward(&http_ctx.client, req, upstream).await,
+        LocationAction::ProxyPass(pass) => match &pass.target {
+            ProxyTarget::Upstream(name) => match http_ctx.upstreams.get(name) {
+                Some(pool) => proxy::proxy_upstream(&http_ctx.client, pool, req).await,
                 None => {
                     tracing::debug!("unknown upstream for proxy_pass");
                     proxy::bad_gateway_response()
                 }
-            }
-        }
+            },
+            ProxyTarget::Direct(addr) => proxy::forward(&http_ctx.client, req, *addr).await,
+        },
         LocationAction::Static(cfg) => {
             static_files::serve(req.method(), path, &loc.path, cfg).await
         }

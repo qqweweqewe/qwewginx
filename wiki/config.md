@@ -87,7 +87,9 @@ proxy_pass http://127.0.0.1:9091;    # direct
 - forwards full client uri (path + query) as-is, no prefix stripping
 - sets `Host` to upstream if client didn't send one
 - upstream down / missing name → **502** `bad gateway\n`
-- multiple `server` in upstream: **round-robin** per worker (feature 8)
+- multiple `server` in upstream: **round-robin** among healthy peers, per worker (feature 8)
+- passive health (feature 9): connect/timeout errors and upstream **502 / 503 / 504** mark peer down for **10s**, retry next peer in the pool; direct `proxy_pass` has no failover
+- all peers down → **502**; other status codes (e.g. app **500**) do not mark peers down
 
 ---
 

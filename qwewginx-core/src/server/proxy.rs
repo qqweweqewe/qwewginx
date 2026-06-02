@@ -1,44 +1,102 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, HOST};
 use hyper::http::uri::Uri;
-use hyper::{Request, Response, StatusCode, Version};
+use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-use crate::config::{Http, ProxyTarget};
+use crate::config::Http;
 
 pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
+/// how long a peer stays out of rotation after a passive failure
+pub const FAIL_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct Peer {
+    addr: SocketAddr,
+    /// epoch ms when peer is healthy again; 0 = up
+    down_until_ms: AtomicU64,
+}
+
+impl Peer {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            down_until_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        let until = self.down_until_ms.load(Ordering::Relaxed);
+        until == 0 || now_ms() >= until
+    }
+
+    fn mark_down(&self) {
+        let until = now_ms().saturating_add(ms_from_duration(FAIL_TIMEOUT));
+        self.down_until_ms.store(until, Ordering::Relaxed);
+        tracing::debug!(addr = %self.addr, "upstream peer marked down");
+    }
+
+    fn mark_up(&self) {
+        self.down_until_ms.store(0, Ordering::Relaxed);
+    }
+}
+
 pub struct UpstreamPool {
-    servers: Vec<SocketAddr>,
+    peers: Vec<Peer>,
     next: AtomicUsize,
 }
 
 impl UpstreamPool {
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         Self {
-            servers,
+            peers: servers.into_iter().map(Peer::new).collect(),
             next: AtomicUsize::new(0),
         }
     }
 
+    /// round-robin among healthy peers only
     pub fn pick(&self) -> Option<SocketAddr> {
-        if self.servers.is_empty() {
+        let n = self.peers.len();
+        if n == 0 {
             return None;
         }
-        let i = self.next.fetch_add(1, Ordering::Relaxed);
-        Some(self.servers[i % self.servers.len()])
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for off in 0..n {
+            let peer = &self.peers[(start + off) % n];
+            if peer.is_healthy() {
+                return Some(peer.addr);
+            }
+        }
+        None
+    }
+
+    fn mark_down(&self, addr: SocketAddr) {
+        if let Some(peer) = self.peers.iter().find(|p| p.addr == addr) {
+            peer.mark_down();
+        }
+    }
+
+    fn mark_up(&self, addr: SocketAddr) {
+        if let Some(peer) = self.peers.iter().find(|p| p.addr == addr) {
+            peer.mark_up();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.peers.len()
     }
 }
 
@@ -61,17 +119,14 @@ impl WorkerHttp {
     }
 }
 
-pub fn resolve_upstream(name: &str, upstreams: &HashMap<String, UpstreamPool>) -> Option<SocketAddr> {
-    upstreams.get(name).and_then(UpstreamPool::pick)
-}
-
-pub fn resolve_target(
+#[cfg(test)]
+fn resolve_target(
     target: &ProxyTarget,
     upstreams: &HashMap<String, UpstreamPool>,
 ) -> Option<SocketAddr> {
     match target {
         ProxyTarget::Direct(addr) => Some(*addr),
-        ProxyTarget::Upstream(name) => resolve_upstream(name, upstreams),
+        ProxyTarget::Upstream(name) => upstreams.get(name).and_then(UpstreamPool::pick),
     }
 }
 
@@ -89,6 +144,25 @@ pub fn build_upstream_uri(addr: SocketAddr, req_uri: &Uri) -> Option<Uri> {
     format!("http://{authority}{pq}").parse().ok()
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn ms_from_duration(d: Duration) -> u64 {
+    d.as_millis() as u64
+}
+
+fn upstream_host(addr: SocketAddr) -> String {
+    if addr.port() == 80 {
+        addr.ip().to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
 fn hop_by_hop(name: &hyper::header::HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -97,54 +171,131 @@ fn hop_by_hop(name: &hyper::header::HeaderName) -> bool {
     ) || name.as_str().starts_with(':')
 }
 
+fn peer_failure_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+struct BufferedRequest {
+    method: Method,
+    uri: Uri,
+    headers: hyper::HeaderMap,
+    body: Bytes,
+}
+
+enum ForwardOutcome {
+    Ok(Response<ResponseBody>),
+    PeerFailed,
+}
+
+pub async fn proxy_upstream(
+    client: &HttpClient,
+    pool: &UpstreamPool,
+    req: Request<Incoming>,
+) -> Response<ResponseBody> {
+    let buffered = match buffer_request(req).await {
+        Some(b) => b,
+        None => return bad_gateway(),
+    };
+
+    let attempts = pool.len().max(1);
+    for attempt in 0..attempts {
+        let Some(upstream) = pool.pick() else {
+            tracing::debug!("no healthy upstream peers");
+            return bad_gateway();
+        };
+        match forward_buffered(client, &buffered, upstream).await {
+            ForwardOutcome::Ok(resp) => {
+                pool.mark_up(upstream);
+                return resp;
+            }
+            ForwardOutcome::PeerFailed => {
+                pool.mark_down(upstream);
+                tracing::debug!(%upstream, attempt, "retrying next upstream peer");
+            }
+        }
+    }
+    tracing::debug!("upstream pool exhausted retries");
+    bad_gateway()
+}
+
 pub async fn forward(
     client: &HttpClient,
     req: Request<Incoming>,
     upstream: SocketAddr,
 ) -> Response<ResponseBody> {
-    let (parts, body) = req.into_parts();
-    let uri = match build_upstream_uri(upstream, &parts.uri) {
-        Some(u) => u,
+    let buffered = match buffer_request(req).await {
+        Some(b) => b,
         None => return bad_gateway(),
     };
-    let body_bytes = match body.collect().await {
+    match forward_buffered(client, &buffered, upstream).await {
+        ForwardOutcome::Ok(resp) => resp,
+        ForwardOutcome::PeerFailed => bad_gateway(),
+    }
+}
+
+async fn buffer_request(req: Request<Incoming>) -> Option<BufferedRequest> {
+    let (parts, body) = req.into_parts();
+    let body = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             tracing::debug!("proxy body read failed: {e}");
-            return bad_gateway();
+            return None;
         }
     };
-    let host = if upstream.port() == 80 {
-        upstream.ip().to_string()
-    } else {
-        upstream.to_string()
+    Some(BufferedRequest {
+        method: parts.method,
+        uri: parts.uri,
+        headers: parts.headers,
+        body,
+    })
+}
+
+async fn forward_buffered(
+    client: &HttpClient,
+    buffered: &BufferedRequest,
+    upstream: SocketAddr,
+) -> ForwardOutcome {
+    let uri = match build_upstream_uri(upstream, &buffered.uri) {
+        Some(u) => u,
+        None => return ForwardOutcome::PeerFailed,
     };
-    let host: HeaderValue = host.parse().expect("host is valid header value");
+    let host: HeaderValue = upstream_host(upstream)
+        .parse()
+        .expect("host is valid header value");
     let mut builder = Request::builder()
-        .method(parts.method)
+        .method(&buffered.method)
         .uri(uri)
         .version(Version::HTTP_11)
         .header(HOST, host);
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in buffered.headers.iter() {
         if hop_by_hop(name) || *name == HOST {
             continue;
         }
         builder = builder.header(name, value);
     }
-    let mut upstream_req = match builder.body(Full::new(body_bytes)) {
+    let mut upstream_req = match builder.body(Full::new(buffered.body.clone())) {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("proxy request build failed: {e}");
-            return bad_gateway();
+            return ForwardOutcome::PeerFailed;
         }
     };
     *upstream_req.version_mut() = Version::HTTP_11;
     upstream_req.extensions_mut().clear();
     match client.request(upstream_req).await {
-        Ok(resp) => resp.map(|b| b.boxed()),
+        Ok(resp) => {
+            if peer_failure_status(resp.status()) {
+                ForwardOutcome::PeerFailed
+            } else {
+                ForwardOutcome::Ok(resp.map(|b| b.boxed()))
+            }
+        }
         Err(e) => {
             tracing::debug!("proxy upstream failed: {e}");
-            bad_gateway()
+            ForwardOutcome::PeerFailed
         }
     }
 }
@@ -172,6 +323,21 @@ pub fn bad_gateway_response() -> Response<ResponseBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProxyTarget;
+
+    impl UpstreamPool {
+        fn force_down(&self, addr: SocketAddr, timeout: Duration) {
+            let peer = self.peers.iter().find(|p| p.addr == addr).expect("peer");
+            let until = now_ms().saturating_add(ms_from_duration(timeout));
+            peer.down_until_ms.store(until, Ordering::Relaxed);
+        }
+
+        fn force_recovered(&self, addr: SocketAddr) {
+            let peer = self.peers.iter().find(|p| p.addr == addr).expect("peer");
+            peer.down_until_ms
+                .store(now_ms().saturating_sub(1), Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn resolve_named_upstream() {
@@ -197,6 +363,46 @@ mod tests {
         let pool = UpstreamPool::new(vec![a, b, c]);
         let picks: Vec<_> = (0..6).map(|_| pool.pick().unwrap()).collect();
         assert_eq!(picks, vec![a, b, c, a, b, c]);
+    }
+
+    #[test]
+    fn pick_skips_down_peer() {
+        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let pool = UpstreamPool::new(vec![a, b]);
+        pool.force_down(a, FAIL_TIMEOUT);
+        for _ in 0..4 {
+            assert_eq!(pool.pick().unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn peer_recovers_after_cooldown() {
+        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let pool = UpstreamPool::new(vec![a, b]);
+        pool.force_down(a, FAIL_TIMEOUT);
+        pool.force_recovered(a);
+        let picks: Vec<_> = (0..2).map(|_| pool.pick().unwrap()).collect();
+        assert_eq!(picks, vec![a, b]);
+    }
+
+    #[test]
+    fn pick_none_when_all_down() {
+        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let pool = UpstreamPool::new(vec![a]);
+        pool.force_down(a, FAIL_TIMEOUT);
+        assert!(pool.pick().is_none());
+    }
+
+    #[test]
+    fn peer_failure_statuses() {
+        assert!(peer_failure_status(StatusCode::BAD_GATEWAY));
+        assert!(peer_failure_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(peer_failure_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!peer_failure_status(StatusCode::OK));
+        assert!(!peer_failure_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!peer_failure_status(StatusCode::NOT_FOUND));
     }
 
     #[test]

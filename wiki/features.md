@@ -17,6 +17,7 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 6 | reverse proxy | `proxy.conf` + `backend.conf` |
 | 7 | static files | `static.conf` |
 | 8 | upstream round-robin | `lb.conf` + `backend1.conf` + `backend2.conf` |
+| 9 | passive upstream health | `lb.conf` + backends (same as 8) |
 
 ---
 
@@ -82,6 +83,14 @@ curl http://127.0.0.1:9090/   # backend2
 curl http://127.0.0.1:9090/   # backend1 again
 ```
 
+**passive upstream health** — same three terminals as load balancing; kill one backend:
+
+```bash
+# with lb.conf + both backends running, then kill backend1 (term 1)
+curl http://127.0.0.1:9090/   # still 200 from backend2
+# restart backend1 — back in rotation after ~10s cooldown
+```
+
 ctrl-c or `kill -TERM <master-pid>` stops workers.
 
 ---
@@ -104,7 +113,7 @@ tokio, hyper, rustls, pest, socket2, tracing, clap.
 
 | # | what |
 |---|------|
-| 9–10 | passive + active upstream health |
+| 10 | active upstream health checks |
 | 11–12 | forward proxy, HTTP CONNECT |
 | 13 | tcp stream tunnel (`stream {}`, l4 relay) |
 | 14+ | logs, plugins, wrk polish |

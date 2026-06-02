@@ -1,10 +1,36 @@
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use qwewginx_core::config::Config;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn directive(self) -> String {
+        format!("qwewginx={}", self.filter_str())
+    }
+
+    fn filter_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "qwewginx", about = "nginx-ish proxy, pet project edition")]
@@ -12,6 +38,10 @@ struct Cli {
     /// config file
     #[arg(short = 'c', long = "config")]
     config: PathBuf,
+
+    /// log level for qwewginx (RUST_LOG still applies to other crates)
+    #[arg(short = 'l', long = "log-level", value_enum, default_value_t = LogLevel::Info)]
+    log_level: LogLevel,
 
     /// parse config and print ast, then exit
     #[arg(long = "print-ast", default_value_t = false)]
@@ -22,13 +52,19 @@ struct Cli {
     worker: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+fn init_tracing(log_level: LogLevel) -> anyhow::Result<()> {
+    let mut filter = EnvFilter::from_default_env();
+    filter = filter.add_directive(log_level.directive().parse()?);
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("qwewginx=info".parse()?))
+        .with_env_filter(filter)
         .with_target(false)
         .init();
+    Ok(())
+}
 
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    init_tracing(cli.log_level)?;
     let cfg = qwewginx_core::config::parse_file(&cli.config)?;
 
     if cli.print_ast {
@@ -41,7 +77,7 @@ fn main() -> anyhow::Result<()> {
     if cli.worker {
         run_worker(cfg)?;
     } else {
-        run_master(&cli.config, cfg)?;
+        run_master(&cli.config, cli.log_level, cfg)?;
     }
 
     Ok(())
@@ -56,7 +92,7 @@ fn run_worker(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_master(config_path: &PathBuf, cfg: Config) -> anyhow::Result<()> {
+fn run_master(config_path: &PathBuf, log_level: LogLevel, cfg: Config) -> anyhow::Result<()> {
     let n = cfg.worker_processes.max(1);
     let exe = std::env::current_exe()?;
     info!("master {} spawning {n} workers", std::process::id());
@@ -67,6 +103,8 @@ fn run_master(config_path: &PathBuf, cfg: Config) -> anyhow::Result<()> {
             .arg("--worker")
             .arg("-c")
             .arg(config_path)
+            .arg("--log-level")
+            .arg(log_level.filter_str())
             .spawn()?;
         children.push(child);
     }

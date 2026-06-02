@@ -62,3 +62,10 @@ cargo run -p qwewginx -- -c examples/backend2.conf   # term 2 — :9092
 cargo run -p qwewginx -- -c examples/lb.conf         # term 3 — :9090
 curl http://127.0.0.1:9090/   # alternates backend1 / backend2
 ```
+
+feature 9 — passive upstream health (same confs as feature 8):
+
+```bash
+# start backend1, backend2, lb.conf as above; then kill backend1
+curl http://127.0.0.1:9090/   # still hits backend2
+```
