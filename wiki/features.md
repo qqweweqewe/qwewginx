@@ -16,6 +16,7 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 5 | tls, alpn h2 + http/1.1 | `tls.conf` |
 | 6 | reverse proxy | `proxy.conf` + `backend.conf` |
 | 7 | static files | `static.conf` |
+| 8 | upstream round-robin | `lb.conf` + `backend1.conf` + `backend2.conf` |
 
 ---
 
@@ -71,6 +72,16 @@ curl http://127.0.0.1:9090/style.css
 curl -I http://127.0.0.1:9090/nope.css   # 404
 ```
 
+**load balancing** — two backends `:9091` + `:9092`, proxy `:9090`
+```bash
+cargo run -p qwewginx -- -c examples/backend1.conf   # term 1
+cargo run -p qwewginx -- -c examples/backend2.conf   # term 2
+cargo run -p qwewginx -- -c examples/lb.conf        # term 3
+curl http://127.0.0.1:9090/   # backend1
+curl http://127.0.0.1:9090/   # backend2
+curl http://127.0.0.1:9090/   # backend1 again
+```
+
 ctrl-c or `kill -TERM <master-pid>` stops workers.
 
 ---
@@ -93,7 +104,7 @@ tokio, hyper, rustls, pest, socket2, tracing, clap.
 
 | # | what |
 |---|------|
-| 8–10 | upstream lb + health |
+| 9–10 | passive + active upstream health |
 | 11–12 | forward proxy, HTTP CONNECT |
 | 13 | tcp stream tunnel (`stream {}`, l4 relay) |
 | 14+ | logs, plugins, wrk polish |

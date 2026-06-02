@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -19,8 +20,30 @@ use crate::config::{Http, ProxyTarget};
 pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
+pub struct UpstreamPool {
+    servers: Vec<SocketAddr>,
+    next: AtomicUsize,
+}
+
+impl UpstreamPool {
+    pub fn new(servers: Vec<SocketAddr>) -> Self {
+        Self {
+            servers,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn pick(&self) -> Option<SocketAddr> {
+        if self.servers.is_empty() {
+            return None;
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        Some(self.servers[i % self.servers.len()])
+    }
+}
+
 pub struct WorkerHttp {
-    pub upstreams: HashMap<String, SocketAddr>,
+    pub upstreams: HashMap<String, UpstreamPool>,
     pub client: HttpClient,
 }
 
@@ -28,8 +51,8 @@ impl WorkerHttp {
     pub fn new(http: &Http) -> Self {
         let mut upstreams = HashMap::new();
         for u in &http.upstreams {
-            if let Some(addr) = u.servers.first() {
-                upstreams.insert(u.name.clone(), *addr);
+            if !u.servers.is_empty() {
+                upstreams.insert(u.name.clone(), UpstreamPool::new(u.servers.clone()));
             }
         }
         let connector = HttpConnector::new();
@@ -38,13 +61,13 @@ impl WorkerHttp {
     }
 }
 
-pub fn resolve_upstream(name: &str, upstreams: &HashMap<String, SocketAddr>) -> Option<SocketAddr> {
-    upstreams.get(name).copied()
+pub fn resolve_upstream(name: &str, upstreams: &HashMap<String, UpstreamPool>) -> Option<SocketAddr> {
+    upstreams.get(name).and_then(UpstreamPool::pick)
 }
 
 pub fn resolve_target(
     target: &ProxyTarget,
-    upstreams: &HashMap<String, SocketAddr>,
+    upstreams: &HashMap<String, UpstreamPool>,
 ) -> Option<SocketAddr> {
     match target {
         ProxyTarget::Direct(addr) => Some(*addr),
@@ -153,7 +176,10 @@ mod tests {
     #[test]
     fn resolve_named_upstream() {
         let mut map = HashMap::new();
-        map.insert("backend".into(), "127.0.0.1:9091".parse().unwrap());
+        map.insert(
+            "backend".into(),
+            UpstreamPool::new(vec!["127.0.0.1:9091".parse().unwrap()]),
+        );
         assert_eq!(
             resolve_target(
                 &ProxyTarget::Upstream("backend".into()),
@@ -161,6 +187,16 @@ mod tests {
             ),
             Some("127.0.0.1:9091".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn round_robin_cycles_peers() {
+        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:9093".parse().unwrap();
+        let pool = UpstreamPool::new(vec![a, b, c]);
+        let picks: Vec<_> = (0..6).map(|_| pool.pick().unwrap()).collect();
+        assert_eq!(picks, vec![a, b, c, a, b, c]);
     }
 
     #[test]

@@ -87,7 +87,7 @@ proxy_pass http://127.0.0.1:9091;    # direct
 - forwards full client uri (path + query) as-is, no prefix stripping
 - sets `Host` to upstream if client didn't send one
 - upstream down / missing name → **502** `bad gateway\n`
-- multiple `server` in upstream: only **first** used (lb is feature 8)
+- multiple `server` in upstream: **round-robin** per worker (feature 8)
 
 ---
 

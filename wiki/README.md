@@ -2,7 +2,7 @@
 
 pet-project nginx-ish proxy in rust. **not production-ready.**
 
-shipped through **feature 7** (static files). next: upstream lb + health.
+shipped through **feature 8** (upstream round-robin). next: upstream health.
 
 ## quick start
 
