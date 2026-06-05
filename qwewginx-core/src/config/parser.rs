@@ -314,11 +314,21 @@ fn apply_health_check(
     Ok(())
 }
 
+fn parse_bool_arg(args: &[String], directive: &str) -> Result<bool, ConfigError> {
+    let v = one_string(args, directive)?;
+    match v.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::Msg(format!("{directive} must be true or false"))),
+    }
+}
+
 fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Server, ConfigError> {
     let mut listeners = Vec::new();
     let mut cert_path = None;
     let mut key_path = None;
     let mut access_log = None;
+    let mut forward_proxy = false;
     let mut locations = Vec::new();
 
     for stmt in stmts {
@@ -346,6 +356,9 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
                     }
                     "access_log" => {
                         access_log = Some(parse_access_log_args(&args)?);
+                    }
+                    "forward_proxy" => {
+                        forward_proxy = parse_bool_arg(&args, "forward_proxy")?;
                     }
                     other => {
                         return Err(ConfigError::Msg(format!(
@@ -387,10 +400,17 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
         ));
     }
 
+    if forward_proxy && !locations.is_empty() {
+        return Err(ConfigError::Msg(
+            "forward_proxy server cannot have location blocks".into(),
+        ));
+    }
+
     Ok(Server {
         listeners,
         tls,
         access_log,
+        forward_proxy,
         locations,
     })
 }

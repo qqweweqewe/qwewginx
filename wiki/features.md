@@ -21,6 +21,8 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 10 | https upstream (`proxy_pass https://`) | `proxy-to-https.conf` + `backend-tls.conf` |
 | 11 | active upstream health checks | `lb-health.conf` + `backend1.conf` + `backend2.conf` |
 | 12 | access log + upstream status logging | `access-log.conf` (+ `lb-health.conf` for transitions) |
+| 13 | forward proxy | `forward-proxy.conf` (+ `backend.conf` for curl -x demo) |
+| 14 | HTTP CONNECT (https via proxy) | `forward-proxy.conf` + `backend-tls1.conf` |
 
 ---
 
@@ -126,6 +128,25 @@ cargo run -p qwewginx -- -c examples/backend1.conf   # term 1
 cargo run -p qwewginx -- -c examples/backend2.conf   # term 2
 cargo run -p qwewginx -- -c examples/lb-health.conf  # term 3
 # kill backend1 — stderr shows WARN upstream peer down; recovery shows INFO peer up
+```
+
+**forward proxy** — client egress via absolute uri (`curl -x`); bind localhost in example:
+
+```bash
+cargo run -p qwewginx -- -c examples/backend.conf        # term 1 — :9091
+cargo run -p qwewginx -- -c examples/forward-proxy.conf  # term 2 — :3128
+curl -x http://127.0.0.1:3128 http://127.0.0.1:9091/   # backend body via proxy
+curl http://127.0.0.1:3128/ -I                         # 400 (relative uri)
+curl --http1.1 -sk -x http://127.0.0.1:3128 https://127.0.0.1:9441/  # CONNECT tunnel (needs tls backend)
+```
+
+**HTTP CONNECT** — tls through forward proxy (`curl --http1.1` to force CONNECT):
+
+```bash
+sh examples/tls/gen-certs.sh   # once
+cargo run -p qwewginx -- -c examples/backend-tls1.conf    # term 1 — :9441 ssl
+cargo run -p qwewginx -- -c examples/forward-proxy.conf    # term 2 — :3128
+curl --http1.1 -sk -x http://127.0.0.1:3128 https://127.0.0.1:9441/
 ```
 
 ctrl-c or `kill -TERM <master-pid>` stops workers.

@@ -16,6 +16,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 socket2 = { version = "0.5", features = ["all"] }
-tokio = { version = "1.43", features = ["rt", "macros", "net", "sync", "signal", "fs"] }
+tokio = { version = "1.43", features = ["rt", "macros", "net", "io-util", "sync", "signal", "fs"] }
 tokio-rustls = "0.26"
 tracing = "0.1"

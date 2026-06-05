@@ -110,3 +110,20 @@ tail -1 examples/access.log
 # peer down/up on stderr at default -l info (lb-health + kill a backend)
 cargo run -p qwewginx -- -c examples/lb-health.conf
 ```
+
+feature 13 — forward proxy:
+
+```bash
+cargo run -p qwewginx -- -c examples/backend.conf        # term 1 — :9091
+cargo run -p qwewginx -- -c examples/forward-proxy.conf  # term 2 — :3128
+curl -x http://127.0.0.1:3128 http://127.0.0.1:9091/
+```
+
+feature 14 — HTTP CONNECT (https through proxy):
+
+```bash
+sh examples/tls/gen-certs.sh   # once
+cargo run -p qwewginx -- -c examples/backend-tls1.conf    # term 1 — :9441 ssl
+cargo run -p qwewginx -- -c examples/forward-proxy.conf  # term 2 — :3128
+curl --http1.1 -sk -x http://127.0.0.1:3128 https://127.0.0.1:9441/
+```

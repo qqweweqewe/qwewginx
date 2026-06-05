@@ -183,6 +183,16 @@ async fn handle(
 }
 
 async fn dispatch(req: Request<Incoming>, server: &Server, http_ctx: &WorkerHttp) -> Handled {
+    if server.forward_proxy {
+        let ProxyResult { response, upstream } =
+            proxy::forward_proxy_request(http_ctx, req).await;
+        return Handled {
+            response,
+            upstream,
+            body_fallback: None,
+        };
+    }
+
     let path = req.uri().path();
     let Some(loc) = match_location(path, &server.locations) else {
         return Handled {

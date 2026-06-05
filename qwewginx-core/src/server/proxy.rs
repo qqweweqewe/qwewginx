@@ -9,9 +9,11 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, HOST};
+use hyper::header::{HeaderMap, HeaderValue, HOST};
 use hyper::http::uri::Uri;
 use hyper::{Method, Request, Response, StatusCode, Version};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -214,6 +216,78 @@ impl WorkerHttp {
             self.client.clone()
         }
     }
+
+    pub fn client_for_scheme(&self, scheme: ProxyScheme) -> &HttpClient {
+        match scheme {
+            ProxyScheme::Http | ProxyScheme::Https => &self.client,
+        }
+    }
+}
+
+pub fn is_forward_proxy_uri(uri: &Uri) -> bool {
+    matches!(uri.scheme_str(), Some("http") | Some("https")) && uri.authority().is_some()
+}
+
+pub fn uri_forward_target(uri: &Uri) -> Option<(ProxyScheme, String, u16)> {
+    let scheme = match uri.scheme_str()? {
+        "http" => ProxyScheme::Http,
+        "https" => ProxyScheme::Https,
+        _ => return None,
+    };
+    let auth = uri.authority()?;
+    let host = auth.host().to_string();
+    let port = auth.port_u16().unwrap_or(match scheme {
+        ProxyScheme::Http => 80,
+        ProxyScheme::Https => 443,
+    });
+    Some((scheme, host, port))
+}
+
+pub async fn resolve_host_port(host: &str, port: u16) -> Option<SocketAddr> {
+    let mut addrs = tokio::net::lookup_host((host, port)).await.ok()?;
+    addrs.next()
+}
+
+pub fn origin_uri_from_forward(req_uri: &Uri) -> Option<Uri> {
+    let pq = req_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
+    pq.parse().ok()
+}
+
+pub fn parse_connect_target(uri: &Uri, headers: &HeaderMap) -> Option<(String, u16)> {
+    if let Some(auth) = uri.authority() {
+        return Some((auth.host().to_string(), auth.port_u16().unwrap_or(443)));
+    }
+    let host = headers.get(HOST)?.to_str().ok()?;
+    parse_host_port_header(host)
+}
+
+fn parse_host_port_header(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('[') {
+        let end = s.find(']')?;
+        let host = s[1..end].to_string();
+        let port = if s.len() > end + 1 && s.as_bytes().get(end + 1) == Some(&b':') {
+            s[end + 2..].parse().ok()?
+        } else {
+            443
+        };
+        return Some((host, port));
+    }
+    if let Some((h, p)) = s.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            if !h.is_empty() && !h.contains(':') {
+                return Some((h.to_string(), port));
+            }
+        }
+    }
+    Some((s.to_string(), 443))
 }
 
 pub fn build_upstream_uri(
@@ -362,6 +436,148 @@ pub async fn proxy_upstream(
     }
 }
 
+pub async fn forward_connect(req: Request<Incoming>) -> ProxyResult {
+    if req.version() == Version::HTTP_2 {
+        return ProxyResult {
+            response: not_implemented("connect over http/2 not supported\n"),
+            upstream: UpstreamMeta::default(),
+        };
+    }
+    let (host, port) = match parse_connect_target(req.uri(), req.headers()) {
+        Some(t) => t,
+        None => {
+            return ProxyResult {
+                response: bad_request("connect target must be host:port\n"),
+                upstream: UpstreamMeta::default(),
+            };
+        }
+    };
+    let upstream_addr = match resolve_host_port(&host, port).await {
+        Some(addr) => addr,
+        None => {
+            tracing::debug!(%host, port, "connect dns resolve failed");
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta::default(),
+            };
+        }
+    };
+    let mut upstream = match TcpStream::connect(upstream_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(%upstream_addr, "connect upstream failed: {e}");
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta::default(),
+            };
+        }
+    };
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let mut client = TokioIo::new(upgraded);
+                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                    tracing::debug!("connect tunnel closed: {e}");
+                }
+            }
+            Err(e) => tracing::debug!("connect upgrade failed: {e}"),
+        }
+    });
+    ProxyResult {
+        response: connect_established(),
+        upstream: UpstreamMeta {
+            upstream_addr: Some(upstream_addr),
+            upstream_status: Some(200),
+            ..Default::default()
+        },
+    }
+}
+
+pub async fn forward_proxy_request(
+    http_ctx: &WorkerHttp,
+    req: Request<Incoming>,
+) -> ProxyResult {
+    if *req.method() == Method::CONNECT {
+        return forward_connect(req).await;
+    }
+    let peek_uri = req.uri().clone();
+    if !is_forward_proxy_uri(&peek_uri) {
+        return ProxyResult {
+            response: bad_request("absolute http or https uri required\n"),
+            upstream: UpstreamMeta::default(),
+        };
+    }
+    let (scheme, host, port) = match uri_forward_target(&peek_uri) {
+        Some(t) => t,
+        None => {
+            return ProxyResult {
+                response: bad_request("absolute http or https uri required\n"),
+                upstream: UpstreamMeta::default(),
+            };
+        }
+    };
+    let upstream = match resolve_host_port(&host, port).await {
+        Some(addr) => addr,
+        None => {
+            tracing::debug!(%host, port, "forward proxy dns resolve failed");
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta::default(),
+            };
+        }
+    };
+    let client = http_ctx.client_for_scheme(scheme);
+    let buffered = match buffer_request(req).await {
+        Some(b) => b,
+        None => {
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta {
+                    upstream_addr: Some(upstream),
+                    ..Default::default()
+                },
+            };
+        }
+    };
+    let outbound_uri = match origin_uri_from_forward(&buffered.uri) {
+        Some(u) => u,
+        None => {
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta {
+                    upstream_addr: Some(upstream),
+                    ..Default::default()
+                },
+            };
+        }
+    };
+    let host_header = buffered
+        .uri
+        .authority()
+        .map(|a| a.to_string())
+        .unwrap_or(host);
+    match forward_outbound(client, &buffered, outbound_uri, host_header).await {
+        ForwardOutcome::Ok {
+            response,
+            upstream_status,
+        } => ProxyResult {
+            response,
+            upstream: UpstreamMeta {
+                upstream_addr: Some(upstream),
+                upstream_status: Some(upstream_status),
+                ..Default::default()
+            },
+        },
+        ForwardOutcome::PeerFailed => ProxyResult {
+            response: bad_gateway(),
+            upstream: UpstreamMeta {
+                upstream_addr: Some(upstream),
+                ..Default::default()
+            },
+        },
+    }
+}
+
 pub async fn forward(
     http_ctx: &WorkerHttp,
     pass: &ProxyPass,
@@ -430,12 +646,22 @@ async fn forward_buffered(
         Some(u) => u,
         None => return ForwardOutcome::PeerFailed,
     };
-    let host: HeaderValue = upstream_host(scheme, upstream)
+    let host = upstream_host(scheme, upstream);
+    forward_outbound(client, buffered, uri, host).await
+}
+
+async fn forward_outbound(
+    client: &HttpClient,
+    buffered: &BufferedRequest,
+    outbound_uri: Uri,
+    host_value: String,
+) -> ForwardOutcome {
+    let host: HeaderValue = host_value
         .parse()
         .expect("host is valid header value");
     let mut builder = Request::builder()
         .method(&buffered.method)
-        .uri(uri)
+        .uri(outbound_uri)
         .version(Version::HTTP_11)
         .header(HOST, host);
     for (name, value) in buffered.headers.iter() {
@@ -470,6 +696,38 @@ async fn forward_buffered(
             ForwardOutcome::PeerFailed
         }
     }
+}
+
+fn bad_request(body: &'static str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "text/plain")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|e: Infallible| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+fn connect_established() -> Response<ResponseBody> {
+    Response::new(
+        Full::new(Bytes::new())
+            .map_err(|e: Infallible| match e {})
+            .boxed(),
+    )
+}
+
+fn not_implemented(body: &'static str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header("content-type", "text/plain")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|e: Infallible| match e {})
+                .boxed(),
+        )
+        .unwrap()
 }
 
 fn bad_gateway() -> Response<ResponseBody> {
@@ -555,5 +813,65 @@ mod tests {
         let uri: Uri = "/".parse().unwrap();
         let out = build_upstream_uri(ProxyScheme::Https, addr, &uri).expect("uri");
         assert_eq!(out.to_string(), "https://127.0.0.1/");
+    }
+
+    #[test]
+    fn forward_proxy_uri_detection() {
+        let abs: Uri = "http://example.com/path".parse().unwrap();
+        let rel: Uri = "/path".parse().unwrap();
+        assert!(is_forward_proxy_uri(&abs));
+        assert!(!is_forward_proxy_uri(&rel));
+    }
+
+    #[test]
+    fn uri_forward_target_parses_host_and_port() {
+        let uri: Uri = "https://example.com:9443/foo".parse().unwrap();
+        let (scheme, host, port) = uri_forward_target(&uri).expect("target");
+        assert_eq!(scheme, ProxyScheme::Https);
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 9443);
+    }
+
+    #[test]
+    fn parse_connect_target_from_authority() {
+        let uri: Uri = "example.com:443".parse().unwrap();
+        let headers = HeaderMap::new();
+        let (host, port) = parse_connect_target(&uri, &headers).expect("target");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_target_default_port() {
+        let uri: Uri = "example.com".parse().unwrap();
+        let (_, port) = parse_connect_target(&uri, &HeaderMap::new()).expect("target");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_target_from_host_header() {
+        let uri: Uri = "/".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("127.0.0.1:9441"));
+        let (host, port) = parse_connect_target(&uri, &headers).expect("target");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9441);
+    }
+
+    #[test]
+    fn origin_uri_strips_absolute_prefix() {
+        let abs: Uri = "http://127.0.0.1:9091/foo?q=1".parse().unwrap();
+        let out = origin_uri_from_forward(&abs).expect("origin uri");
+        assert_eq!(out.to_string(), "/foo?q=1");
+    }
+
+    #[test]
+    fn uri_forward_target_default_ports() {
+        let http: Uri = "http://example.com/".parse().unwrap();
+        let (_, _, port) = uri_forward_target(&http).expect("http");
+        assert_eq!(port, 80);
+        let https: Uri = "https://example.com/".parse().unwrap();
+        let (_, _, port) = uri_forward_target(&https).expect("https");
+        assert_eq!(port, 443);
     }
 }

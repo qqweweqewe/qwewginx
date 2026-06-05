@@ -220,6 +220,7 @@ mod tests {
             listeners: vec![],
             tls: None,
             access_log: Some(AccessLogSetting::Off),
+            forward_proxy: false,
             locations: vec![],
         };
         assert!(resolve_access_log_path(&http, &server).is_none());

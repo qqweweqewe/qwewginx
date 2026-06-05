@@ -50,6 +50,7 @@ http {
 | `listen addr ssl`                | server   | tls + alpn h2/http1.1, needs cert + key |
 | `ssl_certificate path`           | server   | pem file                                |
 | `ssl_certificate_key path`       | server   | pem file, must pair with cert           |
+| `forward_proxy true\|false`      | server   | http forward proxy listener (default false) |
 | `location /path { ... }`         | server   | prefix match, see routing               |
 | `return STATUS "body"`           | location | synthetic response, text/plain          |
 | `proxy_pass http://...`          | location | reverse proxy, see below                |
@@ -109,6 +110,23 @@ upstream backend {
 - optional: `interval N` (seconds), `uri /path`
 - peer **down/up transitions** log at **warn/info** on stderr (only on state change, not every probe)
 
+### forward_proxy (feature 13)
+
+```nginx
+server {
+    listen 127.0.0.1:3128;
+    forward_proxy true;
+}
+```
+
+- client sends **absolute** `http://` or `https://` uri (e.g. `curl -x http://127.0.0.1:3128 http://example.com/`)
+- no `location` blocks on the same server
+- resolves hostname via dns; forwards with existing proxy client (https verifies with system roots)
+- relative uri on forward listener → **400**
+- **CONNECT** `host:port` → **200 Connection Established**, then raw tcp relay (https in browser/curl uses this)
+- connect over **http/2** to proxy → **501**; use http/1.1 to proxy for CONNECT (`curl --http1.1`)
+- example binds localhost — public bind = open relay risk
+
 ### access_log (feature 12)
 
 ```nginx
@@ -163,4 +181,4 @@ ports 80/443 need root or `setcap` — use high ports in dev.
 
 ## not supported (yet)
 
-`stream {}`, forward proxy, CONNECT, `log_format`, `plugins {}`, config reload, graceful drain.
+`stream {}`, `log_format`, `plugins {}`, config reload, graceful drain.

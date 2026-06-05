@@ -54,6 +54,7 @@ pub struct Server {
     pub tls: Option<TlsFiles>,
     /// `None` inherits `http.access_log`.
     pub access_log: Option<AccessLogSetting>,
+    pub forward_proxy: bool,
     pub locations: Vec<Location>,
 }
 
