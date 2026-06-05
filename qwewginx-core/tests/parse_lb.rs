@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use qwewginx_core::config::{parse_file, parse_str, LocationAction, ProxyPass, ProxyTarget};
+use qwewginx_core::config::{
+    parse_file, parse_str, LocationAction, ProxyPass, ProxyScheme, ProxyTarget,
+};
 
 #[test]
 fn parse_lb_conf() {
@@ -19,6 +21,8 @@ fn parse_lb_conf() {
     );
     match &cfg.http.servers[0].locations[0].action {
         LocationAction::ProxyPass(ProxyPass {
+            scheme: ProxyScheme::Http,
+            ssl_verify: true,
             target: ProxyTarget::Upstream(name),
         }) => assert_eq!(name, "backend"),
         _ => panic!("expected proxy_pass"),

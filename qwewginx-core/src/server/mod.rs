@@ -3,6 +3,7 @@ mod listen;
 mod proxy;
 mod static_files;
 mod tls;
+mod upstream_tls;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -121,13 +122,13 @@ async fn handle(
         LocationAction::Return(ret) => return_response(ret),
         LocationAction::ProxyPass(pass) => match &pass.target {
             ProxyTarget::Upstream(name) => match http_ctx.upstreams.get(name) {
-                Some(pool) => proxy::proxy_upstream(&http_ctx.client, pool, req).await,
+                Some(pool) => proxy::proxy_upstream(http_ctx, pass, pool, req).await,
                 None => {
                     tracing::debug!("unknown upstream for proxy_pass");
                     proxy::bad_gateway_response()
                 }
             },
-            ProxyTarget::Direct(addr) => proxy::forward(&http_ctx.client, req, *addr).await,
+            ProxyTarget::Direct(addr) => proxy::forward(http_ctx, pass, req, *addr).await,
         },
         LocationAction::Static(cfg) => {
             static_files::serve(req.method(), path, &loc.path, cfg).await

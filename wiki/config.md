@@ -78,11 +78,12 @@ no regex locations, no `=`, no `try_files`.
 ## proxy_pass
 
 ```nginx
-proxy_pass http://backend;           # upstream name
-proxy_pass http://127.0.0.1:9091;    # direct
+proxy_pass http://backend;              # upstream name, plain http
+proxy_pass https://127.0.0.1:9443;      # direct tls backend
+proxy_ssl_verify off;                   # optional — self-signed dev certs (default on)
 ```
 
-- **http only** — `https://` rejected
+- **http or https** scheme on `proxy_pass` (feature 10)
 - no path suffix on target (`http://backend/foo/` — no)
 - forwards full client uri (path + query) as-is, no prefix stripping
 - sets `Host` to upstream if client didn't send one

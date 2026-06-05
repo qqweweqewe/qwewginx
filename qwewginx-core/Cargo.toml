@@ -12,7 +12,8 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "ht
 pest = "2.7"
 pest_derive = "2.7"
 thiserror = "2.0"
-rustls = "0.23"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "webpki-roots"] }
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1.43", features = ["rt", "macros", "net", "sync", "signal", "fs"] }

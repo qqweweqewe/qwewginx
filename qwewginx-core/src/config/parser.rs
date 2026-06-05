@@ -60,11 +60,39 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
         return Err(ConfigError::Msg("http { } needs at least one server".into()));
     }
 
+    validate_upstream_proxy_schemes(&http)?;
+
     Ok(Config {
         worker_processes,
         events,
         http,
     })
+}
+
+fn validate_upstream_proxy_schemes(http: &Http) -> Result<(), ConfigError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, ProxyScheme> = HashMap::new();
+    for server in &http.servers {
+        for loc in &server.locations {
+            let LocationAction::ProxyPass(pass) = &loc.action else {
+                continue;
+            };
+            let ProxyTarget::Upstream(name) = &pass.target else {
+                continue;
+            };
+            if let Some(prev) = seen.get(name.as_str()) {
+                if *prev != pass.scheme {
+                    return Err(ConfigError::Msg(format!(
+                        "upstream {name}: mixed http:// and https:// in proxy_pass"
+                    )));
+                }
+            } else {
+                seen.insert(name.as_str(), pass.scheme);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_toplevel(
@@ -264,6 +292,7 @@ fn parse_location_block(
     let mut proxy_pass = None;
     let mut root = None;
     let mut index = Vec::new();
+    let mut proxy_ssl_verify = true;
     for stmt in stmts {
         if stmt.as_rule() != Rule::statement {
             continue;
@@ -298,7 +327,24 @@ fn parse_location_block(
                         )));
                     }
                     let url = one_string(&args, "proxy_pass")?;
-                    proxy_pass = Some(parse_proxy_pass(&url)?);
+                    let mut pass = parse_proxy_pass(&url)?;
+                    pass.ssl_verify = proxy_ssl_verify;
+                    proxy_pass = Some(pass);
+                }
+                "proxy_ssl_verify" => {
+                    let v = one_string(&args, "proxy_ssl_verify")?;
+                    proxy_ssl_verify = match v.as_str() {
+                        "off" => false,
+                        "on" => true,
+                        other => {
+                            return Err(ConfigError::Msg(format!(
+                                "proxy_ssl_verify: expected on or off, got {other}"
+                            )));
+                        }
+                    };
+                    if let Some(pass) = proxy_pass.as_mut() {
+                        pass.ssl_verify = proxy_ssl_verify;
+                    }
                 }
                 "root" => {
                     if ret.is_some() || proxy_pass.is_some() || root.is_some() {
@@ -356,9 +402,15 @@ fn parse_location_block(
 }
 
 fn parse_proxy_pass(url: &str) -> Result<ProxyPass, ConfigError> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| ConfigError::Msg("proxy_pass only supports http:// in v1".into()))?;
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (ProxyScheme::Https, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (ProxyScheme::Http, r)
+    } else {
+        return Err(ConfigError::Msg(
+            "proxy_pass must start with http:// or https://".into(),
+        ));
+    };
     if rest.is_empty() {
         return Err(ConfigError::Msg("proxy_pass needs a target".into()));
     }
@@ -373,7 +425,11 @@ fn parse_proxy_pass(url: &str) -> Result<ProxyPass, ConfigError> {
     } else {
         ProxyTarget::Upstream(rest.to_string())
     };
-    Ok(ProxyPass { target })
+    Ok(ProxyPass {
+        scheme,
+        ssl_verify: true,
+        target,
+    })
 }
 
 fn parse_listen_args(args: &[String]) -> Result<Listen, ConfigError> {

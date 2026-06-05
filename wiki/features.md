@@ -18,6 +18,7 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 7 | static files | `static.conf` |
 | 8 | upstream round-robin | `lb.conf` + `backend1.conf` + `backend2.conf` |
 | 9 | passive upstream health | `lb.conf` + backends (same as 8) |
+| 10 | https upstream (`proxy_pass https://`) | `proxy-to-https.conf` + `backend-tls.conf` |
 
 ---
 
@@ -91,6 +92,15 @@ curl http://127.0.0.1:9090/   # still 200 from backend2
 # restart backend1 — back in rotation after ~10s cooldown
 ```
 
+**https upstream** — tls backend `:9443`, plain proxy `:9090`:
+
+```bash
+sh examples/tls/gen-certs.sh
+cargo run -p qwewginx -- -c examples/backend-tls.conf   # term 1
+cargo run -p qwewginx -- -c examples/proxy-to-https.conf # term 2
+curl http://127.0.0.1:9090/   # backend-tls body via tls upstream hop
+```
+
 ctrl-c or `kill -TERM <master-pid>` stops workers.
 
 ---
@@ -113,10 +123,10 @@ tokio, hyper, rustls, pest, socket2, tracing, clap.
 
 | # | what |
 |---|------|
-| 10 | active upstream health checks |
-| 11–12 | forward proxy, HTTP CONNECT |
-| 13 | tcp stream tunnel (`stream {}`, l4 relay) |
-| 14+ | logs, plugins, wrk polish |
+| 11 | active upstream health checks |
+| 12–13 | forward proxy, HTTP CONNECT |
+| 14 | tcp stream tunnel (`stream {}`, l4 relay) |
+| 15+ | logs, plugins, wrk polish |
 
 post-mvp: http/3, websocket, reload, mTLS, etc — only if asked.
 

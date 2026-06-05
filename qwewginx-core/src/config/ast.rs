@@ -69,8 +69,16 @@ pub struct ReturnDirective {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyScheme {
+    Http,
+    Https,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyPass {
+    pub scheme: ProxyScheme,
+    pub ssl_verify: bool,
     pub target: ProxyTarget,
 }
 

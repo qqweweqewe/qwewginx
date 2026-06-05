@@ -69,3 +69,22 @@ feature 9 — passive upstream health (same confs as feature 8):
 # start backend1, backend2, lb.conf as above; then kill backend1
 curl http://127.0.0.1:9090/   # still hits backend2
 ```
+
+feature 10 — https upstream (tls backend):
+
+```bash
+sh examples/tls/gen-certs.sh   # once
+cargo run -p qwewginx -- -c examples/backend-tls.conf    # term 1 — :9443 ssl
+cargo run -p qwewginx -- -c examples/proxy-to-https.conf # term 2 — :9090
+curl http://127.0.0.1:9090/
+```
+
+tls front door + https upstream lb (two tls backends):
+
+```bash
+sh examples/tls/gen-certs.sh   # once
+cargo run -p qwewginx -- -c examples/backend-tls1.conf  # term 1 — :9441 ssl
+cargo run -p qwewginx -- -c examples/backend-tls2.conf  # term 2 — :9442 ssl
+cargo run -p qwewginx -- -c examples/lb-https.conf      # term 3 — :9450 ssl
+curl -k https://127.0.0.1:9450/   # alternates backend-tls1 / backend-tls2
+```

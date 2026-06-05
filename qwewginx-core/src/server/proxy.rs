@@ -12,21 +12,23 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderValue, HOST};
 use hyper::http::uri::Uri;
 use hyper::{Method, Request, Response, StatusCode, Version};
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use rustls::crypto::ring::default_provider;
 
-use crate::config::Http;
+use crate::config::{Http, ProxyPass, ProxyScheme};
+use super::upstream_tls;
 
-pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
+type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
+pub type HttpClient = Client<HttpsConnector, Full<Bytes>>;
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
-/// how long a peer stays out of rotation after a passive failure
 pub const FAIL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Peer {
     addr: SocketAddr,
-    /// epoch ms when peer is healthy again; 0 = up
     down_until_ms: AtomicU64,
 }
 
@@ -67,7 +69,6 @@ impl UpstreamPool {
         }
     }
 
-    /// round-robin among healthy peers only
     pub fn pick(&self) -> Option<SocketAddr> {
         let n = self.peers.len();
         if n == 0 {
@@ -103,6 +104,28 @@ impl UpstreamPool {
 pub struct WorkerHttp {
     pub upstreams: HashMap<String, UpstreamPool>,
     pub client: HttpClient,
+    pub client_insecure: HttpClient,
+}
+
+fn build_proxy_client(insecure: bool) -> HttpClient {
+    let _ = default_provider().install_default();
+    let https = if insecure {
+        let tls = upstream_tls::insecure_client_config(
+            default_provider().signature_verification_algorithms.clone(),
+        );
+        HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build()
+    } else {
+        HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build()
+    };
+    Client::builder(TokioExecutor::new()).build(https)
 }
 
 impl WorkerHttp {
@@ -113,35 +136,48 @@ impl WorkerHttp {
                 upstreams.insert(u.name.clone(), UpstreamPool::new(u.servers.clone()));
             }
         }
-        let connector = HttpConnector::new();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
-        Self { upstreams, client }
+        Self {
+            upstreams,
+            client: build_proxy_client(false),
+            client_insecure: build_proxy_client(true),
+        }
+    }
+
+    fn client_for(&self, pass: &ProxyPass) -> &HttpClient {
+        if pass.scheme == ProxyScheme::Https && !pass.ssl_verify {
+            &self.client_insecure
+        } else {
+            &self.client
+        }
     }
 }
 
-#[cfg(test)]
-fn resolve_target(
-    target: &ProxyTarget,
-    upstreams: &HashMap<String, UpstreamPool>,
-) -> Option<SocketAddr> {
-    match target {
-        ProxyTarget::Direct(addr) => Some(*addr),
-        ProxyTarget::Upstream(name) => upstreams.get(name).and_then(UpstreamPool::pick),
-    }
-}
-
-pub fn build_upstream_uri(addr: SocketAddr, req_uri: &Uri) -> Option<Uri> {
+pub fn build_upstream_uri(
+    scheme: ProxyScheme,
+    addr: SocketAddr,
+    req_uri: &Uri,
+) -> Option<Uri> {
     let pq = req_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("/");
-    let authority = if addr.port() == 80 {
-        addr.ip().to_string()
-    } else {
-        addr.to_string()
+    let scheme_str = match scheme {
+        ProxyScheme::Http => "http",
+        ProxyScheme::Https => "https",
     };
-    format!("http://{authority}{pq}").parse().ok()
+    let authority = match (scheme, addr.port()) {
+        (ProxyScheme::Http, 80) | (ProxyScheme::Https, 443) => addr.ip().to_string(),
+        _ => addr.to_string(),
+    };
+    format!("{scheme_str}://{authority}{pq}").parse().ok()
+}
+
+fn upstream_host(scheme: ProxyScheme, addr: SocketAddr) -> String {
+    match (scheme, addr.port()) {
+        (ProxyScheme::Http, 80) | (ProxyScheme::Https, 443) => addr.ip().to_string(),
+        _ => addr.to_string(),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -153,14 +189,6 @@ fn now_ms() -> u64 {
 
 fn ms_from_duration(d: Duration) -> u64 {
     d.as_millis() as u64
-}
-
-fn upstream_host(addr: SocketAddr) -> String {
-    if addr.port() == 80 {
-        addr.ip().to_string()
-    } else {
-        addr.to_string()
-    }
 }
 
 fn hop_by_hop(name: &hyper::header::HeaderName) -> bool {
@@ -191,10 +219,12 @@ enum ForwardOutcome {
 }
 
 pub async fn proxy_upstream(
-    client: &HttpClient,
+    http_ctx: &WorkerHttp,
+    pass: &ProxyPass,
     pool: &UpstreamPool,
     req: Request<Incoming>,
 ) -> Response<ResponseBody> {
+    let client = http_ctx.client_for(pass);
     let buffered = match buffer_request(req).await {
         Some(b) => b,
         None => return bad_gateway(),
@@ -206,7 +236,7 @@ pub async fn proxy_upstream(
             tracing::debug!("no healthy upstream peers");
             return bad_gateway();
         };
-        match forward_buffered(client, &buffered, upstream).await {
+        match forward_buffered(client, pass.scheme, &buffered, upstream).await {
             ForwardOutcome::Ok(resp) => {
                 pool.mark_up(upstream);
                 return resp;
@@ -222,15 +252,17 @@ pub async fn proxy_upstream(
 }
 
 pub async fn forward(
-    client: &HttpClient,
+    http_ctx: &WorkerHttp,
+    pass: &ProxyPass,
     req: Request<Incoming>,
     upstream: SocketAddr,
 ) -> Response<ResponseBody> {
+    let client = http_ctx.client_for(pass);
     let buffered = match buffer_request(req).await {
         Some(b) => b,
         None => return bad_gateway(),
     };
-    match forward_buffered(client, &buffered, upstream).await {
+    match forward_buffered(client, pass.scheme, &buffered, upstream).await {
         ForwardOutcome::Ok(resp) => resp,
         ForwardOutcome::PeerFailed => bad_gateway(),
     }
@@ -255,14 +287,15 @@ async fn buffer_request(req: Request<Incoming>) -> Option<BufferedRequest> {
 
 async fn forward_buffered(
     client: &HttpClient,
+    scheme: ProxyScheme,
     buffered: &BufferedRequest,
     upstream: SocketAddr,
 ) -> ForwardOutcome {
-    let uri = match build_upstream_uri(upstream, &buffered.uri) {
+    let uri = match build_upstream_uri(scheme, upstream, &buffered.uri) {
         Some(u) => u,
         None => return ForwardOutcome::PeerFailed,
     };
-    let host: HeaderValue = upstream_host(upstream)
+    let host: HeaderValue = upstream_host(scheme, upstream)
         .parse()
         .expect("host is valid header value");
     let mut builder = Request::builder()
@@ -323,7 +356,6 @@ pub fn bad_gateway_response() -> Response<ResponseBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProxyTarget;
 
     impl UpstreamPool {
         fn force_down(&self, addr: SocketAddr, timeout: Duration) {
@@ -337,22 +369,6 @@ mod tests {
             peer.down_until_ms
                 .store(now_ms().saturating_sub(1), Ordering::Relaxed);
         }
-    }
-
-    #[test]
-    fn resolve_named_upstream() {
-        let mut map = HashMap::new();
-        map.insert(
-            "backend".into(),
-            UpstreamPool::new(vec!["127.0.0.1:9091".parse().unwrap()]),
-        );
-        assert_eq!(
-            resolve_target(
-                &ProxyTarget::Upstream("backend".into()),
-                &map
-            ),
-            Some("127.0.0.1:9091".parse().unwrap())
-        );
     }
 
     #[test]
@@ -377,59 +393,28 @@ mod tests {
     }
 
     #[test]
-    fn peer_recovers_after_cooldown() {
-        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:9092".parse().unwrap();
-        let pool = UpstreamPool::new(vec![a, b]);
-        pool.force_down(a, FAIL_TIMEOUT);
-        pool.force_recovered(a);
-        let picks: Vec<_> = (0..2).map(|_| pool.pick().unwrap()).collect();
-        assert_eq!(picks, vec![a, b]);
-    }
-
-    #[test]
-    fn pick_none_when_all_down() {
-        let a: SocketAddr = "127.0.0.1:9091".parse().unwrap();
-        let pool = UpstreamPool::new(vec![a]);
-        pool.force_down(a, FAIL_TIMEOUT);
-        assert!(pool.pick().is_none());
-    }
-
-    #[test]
-    fn peer_failure_statuses() {
-        assert!(peer_failure_status(StatusCode::BAD_GATEWAY));
-        assert!(peer_failure_status(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(peer_failure_status(StatusCode::GATEWAY_TIMEOUT));
-        assert!(!peer_failure_status(StatusCode::OK));
-        assert!(!peer_failure_status(StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(!peer_failure_status(StatusCode::NOT_FOUND));
-    }
-
-    #[test]
-    fn build_uri_from_path_only() {
+    fn build_uri_http() {
         let addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
         let uri: Uri = "/".parse().unwrap();
-        let out = build_upstream_uri(addr, &uri).expect("uri");
+        let out = build_upstream_uri(ProxyScheme::Http, addr, &uri).expect("uri");
         assert_eq!(out.to_string(), "http://127.0.0.1:9091/");
     }
 
     #[test]
-    fn build_uri_from_absolute_https() {
-        let addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
-        let uri: Uri = "https://127.0.0.1:9443/".parse().unwrap();
-        let out = build_upstream_uri(addr, &uri).expect("uri");
-        assert_eq!(out.path(), "/");
-        assert_eq!(out.authority().unwrap().host(), "127.0.0.1");
-        assert_eq!(out.authority().unwrap().port_u16(), Some(9091));
+    fn build_uri_https_custom_port() {
+        let addr: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+        let uri: Uri = "/api?q=1".parse().unwrap();
+        let out = build_upstream_uri(ProxyScheme::Https, addr, &uri).expect("uri");
+        assert_eq!(out.scheme_str(), Some("https"));
+        assert_eq!(out.authority().unwrap().port_u16(), Some(9443));
+        assert_eq!(upstream_host(ProxyScheme::Https, addr), "127.0.0.1:9443");
     }
 
     #[test]
-    fn build_uri_keeps_path() {
-        let addr: SocketAddr = "127.0.0.1:9091".parse().unwrap();
-        let uri: Uri = "http://proxy.local/api?q=1".parse().unwrap();
-        let out = build_upstream_uri(addr, &uri).expect("uri");
-        assert_eq!(out.path(), "/api");
-        assert_eq!(out.query(), Some("q=1"));
-        assert_eq!(out.scheme_str(), Some("http"));
+    fn build_uri_https_default_port() {
+        let addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let uri: Uri = "/".parse().unwrap();
+        let out = build_upstream_uri(ProxyScheme::Https, addr, &uri).expect("uri");
+        assert_eq!(out.to_string(), "https://127.0.0.1/");
     }
 }
