@@ -1,4 +1,6 @@
+mod access_log;
 mod error;
+mod health_probe;
 mod listen;
 mod proxy;
 mod static_files;
@@ -6,7 +8,9 @@ mod tls;
 mod upstream_tls;
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -19,15 +23,32 @@ use hyper_util::server::conn::auto;
 pub use error::ServerError;
 
 use crate::config::{Config, Location, LocationAction, ProxyTarget, ReturnDirective, Server};
-use proxy::{ResponseBody, WorkerHttp};
+use access_log::{
+    content_length_from_headers, resolve_access_log_path, response_body_bytes, write_entry,
+    AccessLog, AccessLogEntry,
+};
+use proxy::{ProxyResult, ResponseBody, UpstreamMeta, WorkerHttp};
+
+struct ServerCtx {
+    server: Server,
+    access_log: Option<Arc<AccessLog>>,
+}
 
 pub async fn run(cfg: Config) -> Result<(), ServerError> {
     let conn_builder = auto::Builder::new(TokioExecutor::new());
     let http_ctx = proxy::worker_http_arc(&cfg.http);
+    health_probe::spawn(&cfg.http, Arc::clone(&http_ctx));
     let mut n = 0;
 
     for server in &cfg.http.servers {
-        let srv = Arc::new(server.clone());
+        let access_log = resolve_access_log_path(&cfg.http, server)
+            .map(|path| AccessLog::open(&path).map(Arc::new))
+            .transpose()
+            .map_err(|e| ServerError::Msg(format!("access_log open failed: {e}")))?;
+        let srv = Arc::new(ServerCtx {
+            server: server.clone(),
+            access_log,
+        });
         let tls_acceptor = match &server.tls {
             Some(files) => Some(tls::TlsAcceptorHandle::load(&files.cert, &files.key)?),
             None => None,
@@ -50,7 +71,7 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
 
             tokio::spawn(async move {
                 loop {
-                    let (stream, _) = match listener.accept().await {
+                    let (stream, remote_addr) = match listener.accept().await {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::error!("accept failed: {e}");
@@ -74,7 +95,11 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                             let svc = service_fn(move |req| {
                                 let srv = Arc::clone(&srv);
                                 let http_ctx = Arc::clone(&http_ctx);
-                                async move { Ok::<_, Infallible>(handle(req, &srv, &http_ctx).await) }
+                                async move {
+                                    Ok::<_, Infallible>(
+                                        handle(req, Some(remote_addr), &srv, &http_ctx).await,
+                                    )
+                                }
                             });
                             if let Err(e) =
                                 conn_builder.serve_connection_with_upgrades(io, svc).await
@@ -88,7 +113,11 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
                             let svc = service_fn(move |req| {
                                 let srv = Arc::clone(&srv);
                                 let http_ctx = Arc::clone(&http_ctx);
-                                async move { Ok::<_, Infallible>(handle(req, &srv, &http_ctx).await) }
+                                async move {
+                                    Ok::<_, Infallible>(
+                                        handle(req, Some(remote_addr), &srv, &http_ctx).await,
+                                    )
+                                }
                             });
                             if let Err(e) =
                                 conn_builder.serve_connection_with_upgrades(io, svc).await
@@ -109,30 +138,103 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
     std::future::pending().await
 }
 
+struct Handled {
+    response: Response<ResponseBody>,
+    upstream: UpstreamMeta,
+    body_fallback: Option<usize>,
+}
+
 async fn handle(
     req: Request<Incoming>,
-    server: &Server,
+    remote_addr: Option<SocketAddr>,
+    ctx: &ServerCtx,
     http_ctx: &WorkerHttp,
 ) -> Response<ResponseBody> {
+    let started = Instant::now();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let version = req.version();
+
+    let handled = dispatch(req, &ctx.server, http_ctx).await;
+
+    if let Some(log) = &ctx.access_log {
+        let status = handled.response.status().as_u16();
+        let body_bytes = response_body_bytes(
+            status,
+            content_length_from_headers(handled.response.headers()),
+            handled.body_fallback,
+        );
+        write_entry(
+            log,
+            AccessLogEntry {
+                remote_addr,
+                method: &method,
+                uri: &uri,
+                version,
+                status,
+                body_bytes,
+                request_time: started,
+                upstream: &handled.upstream,
+            },
+        );
+    }
+
+    handled.response
+}
+
+async fn dispatch(req: Request<Incoming>, server: &Server, http_ctx: &WorkerHttp) -> Handled {
     let path = req.uri().path();
     let Some(loc) = match_location(path, &server.locations) else {
-        return not_found();
+        return Handled {
+            response: not_found(),
+            upstream: UpstreamMeta::default(),
+            body_fallback: Some("not found\n".len()),
+        };
     };
     match &loc.action {
-        LocationAction::Return(ret) => return_response(ret),
+        LocationAction::Return(ret) => Handled {
+            response: return_response(ret),
+            upstream: UpstreamMeta::default(),
+            body_fallback: Some(ret.body.len()),
+        },
         LocationAction::ProxyPass(pass) => match &pass.target {
             ProxyTarget::Upstream(name) => match http_ctx.upstreams.get(name) {
-                Some(pool) => proxy::proxy_upstream(http_ctx, pass, pool, req).await,
+                Some(pool) => {
+                    let ProxyResult { response, upstream } =
+                        proxy::proxy_upstream(http_ctx, pass, pool.as_ref(), name, req).await;
+                    Handled {
+                        response,
+                        upstream,
+                        body_fallback: None,
+                    }
+                }
                 None => {
                     tracing::debug!("unknown upstream for proxy_pass");
-                    proxy::bad_gateway_response()
+                    Handled {
+                        response: proxy::bad_gateway_response(),
+                        upstream: UpstreamMeta {
+                            upstream_name: Some(name.clone()),
+                            ..Default::default()
+                        },
+                        body_fallback: Some("bad gateway\n".len()),
+                    }
                 }
             },
-            ProxyTarget::Direct(addr) => proxy::forward(http_ctx, pass, req, *addr).await,
+            ProxyTarget::Direct(addr) => {
+                let ProxyResult { response, upstream } =
+                    proxy::forward(http_ctx, pass, req, *addr).await;
+                Handled {
+                    response,
+                    upstream,
+                    body_fallback: None,
+                }
+            }
         },
-        LocationAction::Static(cfg) => {
-            static_files::serve(req.method(), path, &loc.path, cfg).await
-        }
+        LocationAction::Static(cfg) => Handled {
+            response: static_files::serve(req.method(), path, &loc.path, cfg).await,
+            upstream: UpstreamMeta::default(),
+            body_fallback: None,
+        },
     }
 }
 

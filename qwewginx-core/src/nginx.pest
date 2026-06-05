@@ -6,7 +6,7 @@ statement = { directive | block }
 
 block = { ident ~ block_open ~ statement* ~ "}" }
 block_open = { "{" | (arg ~ "{") }
-directive = { ident ~ arg+ ~ ";" }
+directive = { ident ~ arg* ~ ";" }
 
 arg = { string | token }
 string = ${ "\"" ~ inner ~ "\"" }

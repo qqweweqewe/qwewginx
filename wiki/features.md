@@ -19,6 +19,8 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 8 | upstream round-robin | `lb.conf` + `backend1.conf` + `backend2.conf` |
 | 9 | passive upstream health | `lb.conf` + backends (same as 8) |
 | 10 | https upstream (`proxy_pass https://`) | `proxy-to-https.conf` + `backend-tls.conf` |
+| 11 | active upstream health checks | `lb-health.conf` + `backend1.conf` + `backend2.conf` |
+| 12 | access log + upstream status logging | `access-log.conf` (+ `lb-health.conf` for transitions) |
 
 ---
 
@@ -101,6 +103,31 @@ cargo run -p qwewginx -- -c examples/proxy-to-https.conf # term 2
 curl http://127.0.0.1:9090/   # backend-tls body via tls upstream hop
 ```
 
+**active health checks** — `health_check` in upstream; kill a backend, wait ~5s:
+
+```bash
+cargo run -p qwewginx -- -c examples/backend1.conf   # term 1
+cargo run -p qwewginx -- -c examples/backend2.conf   # term 2
+cargo run -p qwewginx -- -c examples/lb-health.conf  # term 3
+# kill term 1 — probes mark :9091 down; curl skips it
+curl http://127.0.0.1:9090/
+```
+
+**access log + upstream transitions** — per-request log file; peer up/down at info/warn:
+
+```bash
+rm -f examples/access.log
+cargo run -p qwewginx -- -c examples/access-log.conf
+curl http://127.0.0.1:9090/
+tail -1 examples/access.log   # combined line with status + timing
+
+# upstream transitions (default -l info):
+cargo run -p qwewginx -- -c examples/backend1.conf   # term 1
+cargo run -p qwewginx -- -c examples/backend2.conf   # term 2
+cargo run -p qwewginx -- -c examples/lb-health.conf  # term 3
+# kill backend1 — stderr shows WARN upstream peer down; recovery shows INFO peer up
+```
+
 ctrl-c or `kill -TERM <master-pid>` stops workers.
 
 ---
@@ -123,10 +150,9 @@ tokio, hyper, rustls, pest, socket2, tracing, clap.
 
 | # | what |
 |---|------|
-| 11 | active upstream health checks |
-| 12–13 | forward proxy, HTTP CONNECT |
-| 14 | tcp stream tunnel (`stream {}`, l4 relay) |
-| 15+ | logs, plugins, wrk polish |
+| 13–14 | forward proxy, HTTP CONNECT |
+| 15 | tcp stream tunnel (`stream {}`, l4 relay) |
+| 16+ | plugins, wrk polish, log_format / json access log |
 
 post-mvp: http/3, websocket, reload, mTLS, etc — only if asked.
 

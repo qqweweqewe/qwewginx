@@ -88,3 +88,25 @@ cargo run -p qwewginx -- -c examples/backend-tls2.conf  # term 2 — :9442 ssl
 cargo run -p qwewginx -- -c examples/lb-https.conf      # term 3 — :9450 ssl
 curl -k https://127.0.0.1:9450/   # alternates backend-tls1 / backend-tls2
 ```
+
+feature 11 — active health checks:
+
+```bash
+cargo run -p qwewginx -- -c examples/backend1.conf   # term 1
+cargo run -p qwewginx -- -c examples/backend2.conf   # term 2
+cargo run -p qwewginx -- -c examples/lb-health.conf  # term 3 — probes every 5s
+# kill backend1 — wait a few seconds — curl only hits backend2
+curl http://127.0.0.1:9090/
+```
+
+feature 12 — access log + upstream status logging:
+
+```bash
+rm -f examples/access.log
+cargo run -p qwewginx -- -c examples/access-log.conf
+curl http://127.0.0.1:9090/
+tail -1 examples/access.log
+
+# peer down/up on stderr at default -l info (lb-health + kill a backend)
+cargo run -p qwewginx -- -c examples/lb-health.conf
+```

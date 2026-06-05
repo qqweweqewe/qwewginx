@@ -15,20 +15,45 @@ pub struct Events {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Http {
+    pub access_log: Option<AccessLogSetting>,
     pub upstreams: Vec<Upstream>,
     pub servers: Vec<Server>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessLogSetting {
+    Off,
+    Path(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstream {
     pub name: String,
     pub servers: Vec<SocketAddr>,
+    pub health_check: Option<HealthCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthCheck {
+    pub interval_secs: u32,
+    pub uri: String,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            interval_secs: 5,
+            uri: "/".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
     pub listeners: Vec<Listen>,
     pub tls: Option<TlsFiles>,
+    /// `None` inherits `http.access_log`.
+    pub access_log: Option<AccessLogSetting>,
     pub locations: Vec<Location>,
 }
 

@@ -25,6 +25,7 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
         worker_connections: 1024,
     };
     let mut http = Http {
+        access_log: None,
         upstreams: Vec::new(),
         servers: Vec::new(),
     };
@@ -69,10 +70,16 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UpstreamProxyRef {
+    scheme: ProxyScheme,
+    ssl_verify: bool,
+}
+
 fn validate_upstream_proxy_schemes(http: &Http) -> Result<(), ConfigError> {
     use std::collections::HashMap;
 
-    let mut seen: HashMap<&str, ProxyScheme> = HashMap::new();
+    let mut seen: HashMap<&str, UpstreamProxyRef> = HashMap::new();
     for server in &http.servers {
         for loc in &server.locations {
             let LocationAction::ProxyPass(pass) = &loc.action else {
@@ -81,14 +88,23 @@ fn validate_upstream_proxy_schemes(http: &Http) -> Result<(), ConfigError> {
             let ProxyTarget::Upstream(name) = &pass.target else {
                 continue;
             };
+            let cur = UpstreamProxyRef {
+                scheme: pass.scheme,
+                ssl_verify: pass.ssl_verify,
+            };
             if let Some(prev) = seen.get(name.as_str()) {
-                if *prev != pass.scheme {
+                if prev.scheme != cur.scheme {
                     return Err(ConfigError::Msg(format!(
                         "upstream {name}: mixed http:// and https:// in proxy_pass"
                     )));
                 }
+                if prev.ssl_verify != cur.ssl_verify {
+                    return Err(ConfigError::Msg(format!(
+                        "upstream {name}: inconsistent proxy_ssl_verify across locations"
+                    )));
+                }
             } else {
-                seen.insert(name.as_str(), pass.scheme);
+                seen.insert(name.as_str(), cur);
             }
         }
     }
@@ -141,6 +157,7 @@ fn parse_events_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Eve
 }
 
 fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http, ConfigError> {
+    let mut access_log = None;
     let mut upstreams = Vec::new();
     let mut servers = Vec::new();
     for stmt in stmts {
@@ -148,6 +165,20 @@ fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http,
             continue;
         }
         let item = stmt.into_inner().next().unwrap();
+        if let Rule::directive = item.as_rule() {
+            let mut inner = item.into_inner();
+            let name = inner.next().unwrap().as_str();
+            let args: Vec<String> = inner.map(arg_to_string).collect();
+            match name {
+                "access_log" => access_log = Some(parse_access_log_args(&args)?),
+                other => {
+                    return Err(ConfigError::Msg(format!(
+                        "unknown http directive: {other}"
+                    )));
+                }
+            }
+            continue;
+        }
         if let Rule::block = item.as_rule() {
             let mut inner = item.into_inner();
             let name = inner.next().unwrap().as_str();
@@ -173,7 +204,28 @@ fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http,
             }
         }
     }
-    Ok(Http { upstreams, servers })
+    Ok(Http {
+        access_log,
+        upstreams,
+        servers,
+    })
+}
+
+fn parse_access_log_args(args: &[String]) -> Result<AccessLogSetting, ConfigError> {
+    let arg = args
+        .first()
+        .ok_or_else(|| ConfigError::Msg("access_log needs a path or off".into()))?;
+    if arg == "off" {
+        if args.len() > 1 {
+            return Err(ConfigError::Msg("access_log off takes no extra args".into()));
+        }
+        Ok(AccessLogSetting::Off)
+    } else {
+        if args.len() > 1 {
+            return Err(ConfigError::Msg("access_log takes one path argument".into()));
+        }
+        Ok(AccessLogSetting::Path(PathBuf::from(arg.as_str())))
+    }
 }
 
 fn parse_upstream_block(
@@ -181,6 +233,7 @@ fn parse_upstream_block(
     stmts: Vec<pest::iterators::Pair<'_, Rule>>,
 ) -> Result<Upstream, ConfigError> {
     let mut servers = Vec::new();
+    let mut health_check = None;
     for stmt in stmts {
         if stmt.as_rule() != Rule::statement {
             continue;
@@ -190,28 +243,82 @@ fn parse_upstream_block(
             let mut inner = d.into_inner();
             let dir = inner.next().unwrap().as_str();
             let args: Vec<String> = inner.map(arg_to_string).collect();
-            if dir == "server" {
-                let addr = args
-                    .first()
-                    .ok_or_else(|| ConfigError::Msg("server needs an address".into()))?;
-                servers.push(parse_listen_addr(addr)?);
-            } else {
-                return Err(ConfigError::Msg(format!(
-                    "unknown upstream directive: {dir}"
-                )));
+            match dir {
+                "server" => {
+                    let addr = args
+                        .first()
+                        .ok_or_else(|| ConfigError::Msg("server needs an address".into()))?;
+                    servers.push(parse_listen_addr(addr)?);
+                }
+                "health_check" => {
+                    apply_health_check(&mut health_check, &args)?;
+                }
+                other => {
+                    return Err(ConfigError::Msg(format!(
+                        "unknown upstream directive: {other}"
+                    )));
+                }
             }
         }
     }
     if servers.is_empty() {
         return Err(ConfigError::Msg(format!("upstream {name} needs server")));
     }
-    Ok(Upstream { name, servers })
+    Ok(Upstream {
+        name,
+        servers,
+        health_check,
+    })
+}
+
+fn apply_health_check(
+    health_check: &mut Option<HealthCheck>,
+    args: &[String],
+) -> Result<(), ConfigError> {
+    let hc = health_check.get_or_insert_with(HealthCheck::default);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "interval" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| ConfigError::Msg("health_check interval needs a value".into()))?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| ConfigError::Msg("health_check interval must be a number".into()))?;
+                if n == 0 {
+                    return Err(ConfigError::Msg("health_check interval must be > 0".into()));
+                }
+                hc.interval_secs = n;
+                i += 1;
+            }
+            "uri" => {
+                i += 1;
+                let path = args
+                    .get(i)
+                    .ok_or_else(|| ConfigError::Msg("health_check uri needs a path".into()))?;
+                if !path.starts_with('/') {
+                    return Err(ConfigError::Msg("health_check uri must start with /".into()));
+                }
+                hc.uri = path.clone();
+                i += 1;
+            }
+            other => {
+                return Err(ConfigError::Msg(format!(
+                    "unknown health_check option: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Server, ConfigError> {
     let mut listeners = Vec::new();
     let mut cert_path = None;
     let mut key_path = None;
+    let mut access_log = None;
     let mut locations = Vec::new();
 
     for stmt in stmts {
@@ -236,6 +343,9 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
                     }
                     "ssl_certificate_key" => {
                         key_path = Some(PathBuf::from(one_string(&args, "ssl_certificate_key")?));
+                    }
+                    "access_log" => {
+                        access_log = Some(parse_access_log_args(&args)?);
                     }
                     other => {
                         return Err(ConfigError::Msg(format!(
@@ -280,6 +390,7 @@ fn parse_server_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Ser
     Ok(Server {
         listeners,
         tls,
+        access_log,
         locations,
     })
 }

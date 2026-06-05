@@ -27,6 +27,38 @@ pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
 pub const FAIL_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeConfig {
+    pub scheme: ProxyScheme,
+    pub ssl_verify: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamTransitionReason {
+    PassiveFail,
+    PassiveOk,
+    HealthProbeFail,
+    HealthProbeOk,
+}
+
+impl UpstreamTransitionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PassiveFail => "passive_fail",
+            Self::PassiveOk => "passive_ok",
+            Self::HealthProbeFail => "health_probe_fail",
+            Self::HealthProbeOk => "health_probe_ok",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamMeta {
+    pub upstream_name: Option<String>,
+    pub upstream_addr: Option<SocketAddr>,
+    pub upstream_status: Option<u16>,
+}
+
 struct Peer {
     addr: SocketAddr,
     down_until_ms: AtomicU64,
@@ -45,14 +77,31 @@ impl Peer {
         until == 0 || now_ms() >= until
     }
 
-    fn mark_down(&self) {
+    fn mark_down(&self, upstream: &str, reason: UpstreamTransitionReason) {
+        let was_up = self.is_healthy();
         let until = now_ms().saturating_add(ms_from_duration(FAIL_TIMEOUT));
         self.down_until_ms.store(until, Ordering::Relaxed);
-        tracing::debug!(addr = %self.addr, "upstream peer marked down");
+        if was_up {
+            tracing::warn!(
+                upstream,
+                addr = %self.addr,
+                reason = reason.as_str(),
+                "upstream peer down"
+            );
+        }
     }
 
-    fn mark_up(&self) {
+    fn mark_up(&self, upstream: &str, reason: UpstreamTransitionReason) {
+        let was_up = self.is_healthy();
         self.down_until_ms.store(0, Ordering::Relaxed);
+        if !was_up {
+            tracing::info!(
+                upstream,
+                addr = %self.addr,
+                reason = reason.as_str(),
+                "upstream peer up"
+            );
+        }
     }
 }
 
@@ -84,16 +133,20 @@ impl UpstreamPool {
         None
     }
 
-    fn mark_down(&self, addr: SocketAddr) {
+    pub fn mark_down(&self, upstream: &str, addr: SocketAddr, reason: UpstreamTransitionReason) {
         if let Some(peer) = self.peers.iter().find(|p| p.addr == addr) {
-            peer.mark_down();
+            peer.mark_down(upstream, reason);
         }
     }
 
-    fn mark_up(&self, addr: SocketAddr) {
+    pub fn mark_up(&self, upstream: &str, addr: SocketAddr, reason: UpstreamTransitionReason) {
         if let Some(peer) = self.peers.iter().find(|p| p.addr == addr) {
-            peer.mark_up();
+            peer.mark_up(upstream, reason);
         }
+    }
+
+    pub fn peer_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.iter().map(|p| p.addr).collect()
     }
 
     fn len(&self) -> usize {
@@ -102,7 +155,7 @@ impl UpstreamPool {
 }
 
 pub struct WorkerHttp {
-    pub upstreams: HashMap<String, UpstreamPool>,
+    pub upstreams: HashMap<String, Arc<UpstreamPool>>,
     pub client: HttpClient,
     pub client_insecure: HttpClient,
 }
@@ -133,7 +186,10 @@ impl WorkerHttp {
         let mut upstreams = HashMap::new();
         for u in &http.upstreams {
             if !u.servers.is_empty() {
-                upstreams.insert(u.name.clone(), UpstreamPool::new(u.servers.clone()));
+                upstreams.insert(
+                    u.name.clone(),
+                    Arc::new(UpstreamPool::new(u.servers.clone())),
+                );
             }
         }
         Self {
@@ -148,6 +204,14 @@ impl WorkerHttp {
             &self.client_insecure
         } else {
             &self.client
+        }
+    }
+
+    pub fn client_for_probe(&self, probe: ProbeConfig) -> HttpClient {
+        if probe.scheme == ProxyScheme::Https && !probe.ssl_verify {
+            self.client_insecure.clone()
+        } else {
+            self.client.clone()
         }
     }
 }
@@ -173,7 +237,7 @@ pub fn build_upstream_uri(
     format!("{scheme_str}://{authority}{pq}").parse().ok()
 }
 
-fn upstream_host(scheme: ProxyScheme, addr: SocketAddr) -> String {
+pub fn upstream_host(scheme: ProxyScheme, addr: SocketAddr) -> String {
     match (scheme, addr.port()) {
         (ProxyScheme::Http, 80) | (ProxyScheme::Https, 443) => addr.ip().to_string(),
         _ => addr.to_string(),
@@ -214,41 +278,88 @@ struct BufferedRequest {
 }
 
 enum ForwardOutcome {
-    Ok(Response<ResponseBody>),
+    Ok {
+        response: Response<ResponseBody>,
+        upstream_status: u16,
+    },
     PeerFailed,
+}
+
+pub struct ProxyResult {
+    pub response: Response<ResponseBody>,
+    pub upstream: UpstreamMeta,
 }
 
 pub async fn proxy_upstream(
     http_ctx: &WorkerHttp,
     pass: &ProxyPass,
     pool: &UpstreamPool,
+    upstream_name: &str,
     req: Request<Incoming>,
-) -> Response<ResponseBody> {
+) -> ProxyResult {
     let client = http_ctx.client_for(pass);
     let buffered = match buffer_request(req).await {
         Some(b) => b,
-        None => return bad_gateway(),
+        None => {
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta {
+                    upstream_name: Some(upstream_name.into()),
+                    ..Default::default()
+                },
+            };
+        }
     };
 
     let attempts = pool.len().max(1);
     for attempt in 0..attempts {
         let Some(upstream) = pool.pick() else {
-            tracing::debug!("no healthy upstream peers");
-            return bad_gateway();
+            tracing::warn!(upstream = upstream_name, "no healthy upstream peers");
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta {
+                    upstream_name: Some(upstream_name.into()),
+                    ..Default::default()
+                },
+            };
         };
         match forward_buffered(client, pass.scheme, &buffered, upstream).await {
-            ForwardOutcome::Ok(resp) => {
-                pool.mark_up(upstream);
-                return resp;
+            ForwardOutcome::Ok {
+                response,
+                upstream_status,
+            } => {
+                pool.mark_up(
+                    upstream_name,
+                    upstream,
+                    UpstreamTransitionReason::PassiveOk,
+                );
+                return ProxyResult {
+                    response,
+                    upstream: UpstreamMeta {
+                        upstream_name: Some(upstream_name.into()),
+                        upstream_addr: Some(upstream),
+                        upstream_status: Some(upstream_status),
+                    },
+                };
             }
             ForwardOutcome::PeerFailed => {
-                pool.mark_down(upstream);
+                pool.mark_down(
+                    upstream_name,
+                    upstream,
+                    UpstreamTransitionReason::PassiveFail,
+                );
                 tracing::debug!(%upstream, attempt, "retrying next upstream peer");
             }
         }
     }
     tracing::debug!("upstream pool exhausted retries");
-    bad_gateway()
+    ProxyResult {
+        response: bad_gateway(),
+        upstream: UpstreamMeta {
+            upstream_name: Some(upstream_name.into()),
+            ..Default::default()
+        },
+    }
 }
 
 pub async fn forward(
@@ -256,15 +367,39 @@ pub async fn forward(
     pass: &ProxyPass,
     req: Request<Incoming>,
     upstream: SocketAddr,
-) -> Response<ResponseBody> {
+) -> ProxyResult {
     let client = http_ctx.client_for(pass);
     let buffered = match buffer_request(req).await {
         Some(b) => b,
-        None => return bad_gateway(),
+        None => {
+            return ProxyResult {
+                response: bad_gateway(),
+                upstream: UpstreamMeta {
+                    upstream_addr: Some(upstream),
+                    ..Default::default()
+                },
+            };
+        }
     };
     match forward_buffered(client, pass.scheme, &buffered, upstream).await {
-        ForwardOutcome::Ok(resp) => resp,
-        ForwardOutcome::PeerFailed => bad_gateway(),
+        ForwardOutcome::Ok {
+            response,
+            upstream_status,
+        } => ProxyResult {
+            response,
+            upstream: UpstreamMeta {
+                upstream_addr: Some(upstream),
+                upstream_status: Some(upstream_status),
+                ..Default::default()
+            },
+        },
+        ForwardOutcome::PeerFailed => ProxyResult {
+            response: bad_gateway(),
+            upstream: UpstreamMeta {
+                upstream_addr: Some(upstream),
+                ..Default::default()
+            },
+        },
     }
 }
 
@@ -320,10 +455,14 @@ async fn forward_buffered(
     upstream_req.extensions_mut().clear();
     match client.request(upstream_req).await {
         Ok(resp) => {
+            let status = resp.status().as_u16();
             if peer_failure_status(resp.status()) {
                 ForwardOutcome::PeerFailed
             } else {
-                ForwardOutcome::Ok(resp.map(|b| b.boxed()))
+                ForwardOutcome::Ok {
+                    upstream_status: status,
+                    response: resp.map(|b| b.boxed()),
+                }
             }
         }
         Err(e) => {

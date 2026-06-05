@@ -44,6 +44,8 @@ http {
 | `worker_processes N`             | top      | master spawns N workers (default 1)     |
 | `worker_connections N`           | events   | default 1024, not enforced yet          |
 | `upstream name { server addr; }` | http     | named backend for proxy_pass            |
+| `access_log path`                | http, server | per-request log file (default off)  |
+| `access_log off`                 | http, server | disable access log for scope        |
 | `listen addr`                    | server   | `127.0.0.1:8080` or `:8080` → localhost |
 | `listen addr ssl`                | server   | tls + alpn h2/http1.1, needs cert + key |
 | `ssl_certificate path`           | server   | pem file                                |
@@ -92,6 +94,39 @@ proxy_ssl_verify off;                   # optional — self-signed dev certs (de
 - passive health (feature 9): connect/timeout errors and upstream **502 / 503 / 504** mark peer down for **10s**, retry next peer in the pool; direct `proxy_pass` has no failover
 - all peers down → **502**; other status codes (e.g. app **500**) do not mark peers down
 
+### upstream health_check (feature 11)
+
+```nginx
+upstream backend {
+    server 127.0.0.1:9091;
+    health_check;                      # enable (interval 5s, uri /)
+    health_check interval 3 uri /health;
+}
+```
+
+- active **GET** probe per peer; **2xx** → up, else down (shares passive health state)
+- scheme/ssl from matching `proxy_pass` locations; upstream must be referenced in a `proxy_pass`
+- optional: `interval N` (seconds), `uri /path`
+- peer **down/up transitions** log at **warn/info** on stderr (only on state change, not every probe)
+
+### access_log (feature 12)
+
+```nginx
+http {
+    access_log /var/log/qwewginx/access.log;   # default for all servers
+
+    server {
+        listen 127.0.0.1:8080;
+        access_log off;                        # per-server override
+    }
+}
+```
+
+- **off by default** — enable at `http {}` and/or per `server {}` (server wins)
+- one fixed combined line per request: remote addr, time, request, status, bytes, request time, `upstream=name:addr`, `upstream_status`
+- append mode; safe with multiple workers (`O_APPEND`)
+- diagnostics still go to stderr via `-l` / `--log-level` (separate from access log)
+
 ---
 
 ## static files
@@ -128,6 +163,6 @@ ports 80/443 need root or `setcap` — use high ports in dev.
 
 ## not supported (yet)
 
-`stream {}`, forward proxy, CONNECT, access_log, plugins, config reload, graceful drain.
+`stream {}`, forward proxy, CONNECT, `log_format`, plugins, config reload, graceful drain.
 
 see [features.md](features.md) for roadmap-ish list.
