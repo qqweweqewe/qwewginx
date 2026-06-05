@@ -2,7 +2,7 @@
 
 pet-project nginx-ish proxy in rust. **not production-ready.**
 
-shipped through **feature 12** (access log + upstream status logging). next: forward proxy.
+shipped through **feature 12** (access log + upstream status logging).
 
 ## quick start
 

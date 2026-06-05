@@ -146,18 +146,6 @@ tokio, hyper, rustls, pest, socket2, tracing, clap.
 
 ---
 
-## next up
-
-| # | what |
-|---|------|
-| 13–14 | forward proxy, HTTP CONNECT |
-| 15 | tcp stream tunnel (`stream {}`, l4 relay) |
-| 16+ | plugins, wrk polish, log_format / json access log |
-
-post-mvp: http/3, websocket, reload, mTLS, etc — only if asked.
-
----
-
 ## tests
 
 ```bash

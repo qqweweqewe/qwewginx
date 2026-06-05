@@ -163,6 +163,4 @@ ports 80/443 need root or `setcap` — use high ports in dev.
 
 ## not supported (yet)
 
-`stream {}`, forward proxy, CONNECT, `log_format`, plugins, config reload, graceful drain.
-
-see [features.md](features.md) for roadmap-ish list.
+`stream {}`, forward proxy, CONNECT, `log_format`, `plugins {}`, config reload, graceful drain.
