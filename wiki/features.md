@@ -23,6 +23,7 @@ what works today + how to try it. one conf per feature in `examples/`.
 | 12 | access log + upstream status logging | `access-log.conf` (+ `lb-health.conf` for transitions) |
 | 13 | forward proxy | `forward-proxy.conf` (+ `backend.conf` for curl -x demo) |
 | 14 | HTTP CONNECT (https via proxy) | `forward-proxy.conf` + `backend-tls1.conf` |
+| 15 | tcp stream relay (`stream {}`) | `stream.conf` or `stream-only.conf` |
 
 ---
 
@@ -148,6 +149,19 @@ cargo run -p qwewginx -- -c examples/backend-tls1.conf    # term 1 — :9441 ssl
 cargo run -p qwewginx -- -c examples/forward-proxy.conf    # term 2 — :3128
 curl --http1.1 -sk -x http://127.0.0.1:3128 https://127.0.0.1:9441/
 ```
+
+**stream (tcp relay)** — raw tcp, e.g. minecraft java on `:25565`:
+
+```bash
+# term 1 — fake backend (or your mc server on :25566)
+nc -l 127.0.0.1 25566
+# term 2
+cargo run -p qwewginx -- -c examples/stream.conf
+# term 3 — bytes flow through qwewginx
+nc 127.0.0.1 25565
+```
+
+`stream-only.conf` works with no `http {}` block.
 
 ctrl-c or `kill -TERM <master-pid>` stops workers.
 

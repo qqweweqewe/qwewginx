@@ -127,3 +127,11 @@ cargo run -p qwewginx -- -c examples/backend-tls1.conf    # term 1 — :9441 ssl
 cargo run -p qwewginx -- -c examples/forward-proxy.conf  # term 2 — :3128
 curl --http1.1 -sk -x http://127.0.0.1:3128 https://127.0.0.1:9441/
 ```
+
+feature 15 — tcp stream relay (minecraft / raw tcp):
+
+```bash
+nc -l 127.0.0.1 25566                              # term 1 — backend
+cargo run -p qwewginx -- -c examples/stream.conf   # term 2 — :25565 -> :25566
+nc 127.0.0.1 25565                                 # term 3 — type, see echo on term 1
+```

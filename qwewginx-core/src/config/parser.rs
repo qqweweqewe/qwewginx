@@ -24,6 +24,7 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
     let mut events = Events {
         worker_connections: 1024,
     };
+    let mut stream = Stream::default();
     let mut http = Http {
         access_log: None,
         upstreams: Vec::new(),
@@ -46,6 +47,7 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
                 match name {
                     "events" => events = parse_events_block(stmts)?,
                     "http" => http = parse_http_block(stmts)?,
+                    "stream" => stream = parse_stream_block(stmts)?,
                     other => {
                         return Err(ConfigError::Msg(format!(
                             "unknown top-level block: {other}"
@@ -57,17 +59,93 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
         }
     }
 
-    if http.servers.is_empty() {
-        return Err(ConfigError::Msg("http { } needs at least one server".into()));
+    if http.servers.is_empty() && stream.servers.is_empty() {
+        return Err(ConfigError::Msg(
+            "need at least one server in http { } or stream { }".into(),
+        ));
     }
 
-    validate_upstream_proxy_schemes(&http)?;
+    if !http.servers.is_empty() {
+        validate_upstream_proxy_schemes(&http)?;
+    }
 
     Ok(Config {
         worker_processes,
         events,
+        stream,
         http,
     })
+}
+
+fn parse_stream_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Stream, ConfigError> {
+    let mut servers = Vec::new();
+    for stmt in stmts {
+        if stmt.as_rule() != Rule::statement {
+            continue;
+        }
+        let item = stmt.into_inner().next().unwrap();
+        if let Rule::block = item.as_rule() {
+            let mut inner = item.into_inner();
+            let name = inner.next().unwrap().as_str();
+            if name != "server" {
+                return Err(ConfigError::Msg(format!("unknown stream block: {name}")));
+            }
+            let (_open, inner_stmts) = split_block_open(inner)?;
+            servers.push(parse_stream_server_block(inner_stmts)?);
+        } else {
+            return Err(ConfigError::Msg(
+                "stream { } only allows server blocks".into(),
+            ));
+        }
+    }
+    if servers.is_empty() {
+        return Err(ConfigError::Msg("stream { } needs at least one server".into()));
+    }
+    Ok(Stream { servers })
+}
+
+fn parse_stream_server_block(
+    stmts: Vec<pest::iterators::Pair<'_, Rule>>,
+) -> Result<StreamServer, ConfigError> {
+    let mut listen = None;
+    let mut proxy_pass = None;
+    for stmt in stmts {
+        if stmt.as_rule() != Rule::statement {
+            continue;
+        }
+        let d = stmt.into_inner().next().unwrap();
+        if let Rule::directive = d.as_rule() {
+            let mut inner = d.into_inner();
+            let name = inner.next().unwrap().as_str();
+            let args: Vec<String> = inner.map(arg_to_string).collect();
+            match name {
+                "listen" => {
+                    if args.is_empty() {
+                        return Err(ConfigError::Msg("listen needs an address".into()));
+                    }
+                    if args.len() > 1 {
+                        return Err(ConfigError::Msg(
+                            "stream listen takes one address (no ssl)".into(),
+                        ));
+                    }
+                    listen = Some(parse_listen_addr(&args[0])?);
+                }
+                "proxy_pass" => {
+                    let addr = one_string(&args, "proxy_pass")?;
+                    proxy_pass = Some(parse_listen_addr(&addr)?);
+                }
+                other => {
+                    return Err(ConfigError::Msg(format!(
+                        "unknown stream server directive: {other}"
+                    )));
+                }
+            }
+        }
+    }
+    let listen = listen.ok_or_else(|| ConfigError::Msg("stream server needs listen".into()))?;
+    let proxy_pass =
+        proxy_pass.ok_or_else(|| ConfigError::Msg("stream server needs proxy_pass".into()))?;
+    Ok(StreamServer { listen, proxy_pass })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -5,7 +5,19 @@ use std::path::PathBuf;
 pub struct Config {
     pub worker_processes: u32,
     pub events: Events,
+    pub stream: Stream,
     pub http: Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stream {
+    pub servers: Vec<StreamServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamServer {
+    pub listen: SocketAddr,
+    pub proxy_pass: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

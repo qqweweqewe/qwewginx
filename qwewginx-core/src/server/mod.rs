@@ -4,6 +4,7 @@ mod health_probe;
 mod listen;
 mod proxy;
 mod static_files;
+mod stream;
 mod tls;
 mod upstream_tls;
 
@@ -38,7 +39,7 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
     let conn_builder = auto::Builder::new(TokioExecutor::new());
     let http_ctx = proxy::worker_http_arc(&cfg.http);
     health_probe::spawn(&cfg.http, Arc::clone(&http_ctx));
-    let mut n = 0;
+    let mut n = stream::serve(&cfg.stream).await?;
 
     for server in &cfg.http.servers {
         let access_log = resolve_access_log_path(&cfg.http, server)

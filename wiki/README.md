@@ -2,7 +2,7 @@
 
 pet-project nginx-ish proxy in rust. **not production-ready.**
 
-shipped through **feature 14** (HTTP CONNECT via forward proxy).
+shipped through **feature 15** (tcp `stream {}` relay).
 
 ## quick start
 

@@ -43,6 +43,9 @@ http {
 | -------------------------------- | -------- | --------------------------------------- |
 | `worker_processes N`             | top      | master spawns N workers (default 1)     |
 | `worker_connections N`           | events   | default 1024, not enforced yet          |
+| `stream { server { ... } }`      | top      | tcp l4 relay (optional; no http required) |
+| `listen addr`                    | stream server | plain tcp listen                   |
+| `proxy_pass host:port`           | stream server | backend socket address             |
 | `upstream name { server addr; }` | http     | named backend for proxy_pass            |
 | `access_log path`                | http, server | per-request log file (default off)  |
 | `access_log off`                 | http, server | disable access log for scope        |
@@ -109,6 +112,21 @@ upstream backend {
 - scheme/ssl from matching `proxy_pass` locations; upstream must be referenced in a `proxy_pass`
 - optional: `interval N` (seconds), `uri /path`
 - peer **down/up transitions** log at **warn/info** on stderr (only on state change, not every probe)
+
+### stream (feature 15)
+
+```nginx
+stream {
+    server {
+        listen 127.0.0.1:25565;
+        proxy_pass 127.0.0.1:25566;
+    }
+}
+```
+
+- opaque tcp relay (`copy_bidirectional`) — minecraft java, ssh, redis, etc.
+- `http {}` optional; need at least one `http` or `stream` server in the config
+- no tls on stream listeners yet; no stream upstream lb
 
 ### forward_proxy (feature 13)
 
@@ -181,4 +199,4 @@ ports 80/443 need root or `setcap` — use high ports in dev.
 
 ## not supported (yet)
 
-`stream {}`, `log_format`, `plugins {}`, config reload, graceful drain.
+`log_format`, `plugins {}`, config reload, graceful drain.
