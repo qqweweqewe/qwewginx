@@ -24,7 +24,7 @@ cargo test
 
 ```
 qwewginx/        # binary
-qwewginx-core/   # config parser + (later) server/proxy stuff
+qwewginx-core/   # config parser + http/stream server
 examples/        # sample .conf files
 ```
 
