@@ -21,6 +21,7 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
     let file = pairs.next().unwrap();
 
     let mut worker_processes = 1u32;
+    let mut plugins = Plugins::default();
     let mut events = Events {
         worker_connections: 1024,
     };
@@ -38,13 +39,21 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
                 let mut inner = item.into_inner();
                 let name = inner.next().unwrap().as_str();
                 let args: Vec<String> = inner.map(arg_to_string).collect();
-                apply_toplevel(&mut worker_processes, &mut events, &mut http, name, &args)?;
+                apply_toplevel(&mut worker_processes, name, &args)?;
             }
             Rule::block => {
                 let mut inner = item.into_inner();
                 let name = inner.next().unwrap().as_str();
-                let (_open, stmts) = split_block_open(inner)?;
+                let (open, stmts) = split_block_open(inner)?;
                 match name {
+                    "plugins" => {
+                        if open != BlockOpen::Bare {
+                            return Err(ConfigError::Msg(
+                                "plugins { } must not have a block header".into(),
+                            ));
+                        }
+                        plugins = parse_plugins_block(stmts)?;
+                    }
                     "events" => events = parse_events_block(stmts)?,
                     "http" => http = parse_http_block(stmts)?,
                     "stream" => stream = parse_stream_block(stmts)?,
@@ -71,10 +80,87 @@ pub fn parse_str(src: &str) -> Result<Config, ConfigError> {
 
     Ok(Config {
         worker_processes,
+        plugins,
         events,
         stream,
         http,
     })
+}
+
+fn parse_plugins_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Plugins, ConfigError> {
+    let mut registry = None;
+    let mut entries: Vec<PluginEntry> = Vec::new();
+    for stmt in stmts {
+        if stmt.as_rule() != Rule::statement {
+            continue;
+        }
+        let item = stmt.into_inner().next().unwrap();
+        match item.as_rule() {
+            Rule::directive => {
+                let mut inner = item.into_inner();
+                let name = inner.next().unwrap().as_str();
+                let args: Vec<String> = inner.map(arg_to_string).collect();
+                if name != "registry" {
+                    return Err(ConfigError::Msg(format!(
+                        "unknown plugins directive: {name}"
+                    )));
+                }
+                if registry.is_some() {
+                    return Err(ConfigError::Msg("duplicate registry directive".into()));
+                }
+                registry = Some(one_string(&args, "registry")?);
+            }
+            Rule::block => {
+                let mut inner = item.into_inner();
+                let plugin_name = inner.next().unwrap().as_str().to_string();
+                let (open, inner_stmts) = split_block_open(inner)?;
+                let BlockOpen::Named(header) = open else {
+                    return Err(ConfigError::Msg(format!(
+                        "plugin {plugin_name} needs a version"
+                    )));
+                };
+                if entries.iter().any(|e| e.name == plugin_name) {
+                    return Err(ConfigError::Msg(format!(
+                        "duplicate plugin entry: {plugin_name}"
+                    )));
+                }
+                entries.push(PluginEntry {
+                    name: plugin_name,
+                    version: header.primary,
+                    source: if header.from_local {
+                        PluginSource::Local
+                    } else {
+                        PluginSource::Curated
+                    },
+                    directives: parse_plugin_directives(inner_stmts)?,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(Plugins { registry, entries })
+}
+
+fn parse_plugin_directives(
+    stmts: Vec<pest::iterators::Pair<'_, Rule>>,
+) -> Result<Vec<PluginDirective>, ConfigError> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        if stmt.as_rule() != Rule::statement {
+            continue;
+        }
+        let item = stmt.into_inner().next().unwrap();
+        if item.as_rule() != Rule::directive {
+            return Err(ConfigError::Msg(
+                "plugin blocks only allow directives".into(),
+            ));
+        }
+        let mut inner = item.into_inner();
+        let name = inner.next().unwrap().as_str().to_string();
+        let args: Vec<String> = inner.map(arg_to_string).collect();
+        out.push(PluginDirective { name, args });
+    }
+    Ok(out)
 }
 
 fn parse_stream_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Stream, ConfigError> {
@@ -90,7 +176,10 @@ fn parse_stream_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Str
             if name != "server" {
                 return Err(ConfigError::Msg(format!("unknown stream block: {name}")));
             }
-            let (_open, inner_stmts) = split_block_open(inner)?;
+            let (open, inner_stmts) = split_block_open(inner)?;
+            if open != BlockOpen::Bare {
+                return Err(ConfigError::Msg("stream server { } must be bare".into()));
+            }
             servers.push(parse_stream_server_block(inner_stmts)?);
         } else {
             return Err(ConfigError::Msg(
@@ -191,8 +280,6 @@ fn validate_upstream_proxy_schemes(http: &Http) -> Result<(), ConfigError> {
 
 fn apply_toplevel(
     worker_processes: &mut u32,
-    _events: &mut Events,
-    _http: &mut Http,
     name: &str,
     args: &[String],
 ) -> Result<(), ConfigError> {
@@ -260,15 +347,24 @@ fn parse_http_block(stmts: Vec<pest::iterators::Pair<'_, Rule>>) -> Result<Http,
         if let Rule::block = item.as_rule() {
             let mut inner = item.into_inner();
             let name = inner.next().unwrap().as_str();
-            let (block_name, inner_stmts) = split_block_open(inner)?;
+            let (open, inner_stmts) = split_block_open(inner)?;
             match name {
                 "server" => {
+                    if open != BlockOpen::Bare {
+                        return Err(ConfigError::Msg("server { } must be bare".into()));
+                    }
                     servers.push(parse_server_block(inner_stmts)?);
                 }
                 "upstream" => {
-                    let upstream_name = block_name.ok_or_else(|| {
-                        ConfigError::Msg("upstream needs a name".into())
-                    })?;
+                    let BlockOpen::Named(header) = open else {
+                        return Err(ConfigError::Msg("upstream needs a name".into()));
+                    };
+                    if header.from_local {
+                        return Err(ConfigError::Msg(
+                            "upstream name cannot use from local".into(),
+                        ));
+                    }
+                    let upstream_name = header.primary;
                     if upstreams.iter().any(|u: &Upstream| u.name == upstream_name) {
                         return Err(ConfigError::Msg(format!(
                             "duplicate upstream: {upstream_name}"
@@ -673,9 +769,21 @@ fn parse_listen_addr(s: &str) -> Result<SocketAddr, ConfigError> {
         .map_err(|_| ConfigError::Msg(format!("bad listen address: {s}")))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockHeader {
+    primary: String,
+    from_local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockOpen {
+    Bare,
+    Named(BlockHeader),
+}
+
 fn split_block_open(
     inner: pest::iterators::Pairs<'_, Rule>,
-) -> Result<(Option<String>, Vec<pest::iterators::Pair<'_, Rule>>), ConfigError> {
+) -> Result<(BlockOpen, Vec<pest::iterators::Pair<'_, Rule>>), ConfigError> {
     let mut it = inner.into_iter();
     let open = it.next().unwrap();
     match open.as_rule() {
@@ -683,12 +791,29 @@ fn split_block_open(
             let mut oi = open.into_inner();
             let first = oi.next();
             if first.is_none() {
-                // bare "{"
-                return Ok((None, it.collect()));
+                return Ok((BlockOpen::Bare, it.collect()));
             }
-            // path before "{"
-            let path = arg_to_string(first.unwrap());
-            Ok((Some(path), it.collect()))
+            let header_pair = first.unwrap();
+            if header_pair.as_rule() == Rule::block_header {
+                let mut hi = header_pair.into_inner();
+                let primary = arg_to_string(hi.next().unwrap());
+                let from_local = hi.any(|p| p.as_rule() == Rule::plugin_source);
+                return Ok((
+                    BlockOpen::Named(BlockHeader {
+                        primary,
+                        from_local,
+                    }),
+                    it.collect(),
+                ));
+            }
+            // legacy single-arg header (should not occur with current grammar)
+            Ok((
+                BlockOpen::Named(BlockHeader {
+                    primary: arg_to_string(header_pair),
+                    from_local: false,
+                }),
+                it.collect(),
+            ))
         }
         _ => Err(ConfigError::Msg("expected block_open".into())),
     }
@@ -697,9 +822,14 @@ fn split_block_open(
 fn split_location_open(
     inner: pest::iterators::Pairs<'_, Rule>,
 ) -> Result<(String, Vec<pest::iterators::Pair<'_, Rule>>), ConfigError> {
-    let (path, stmts) = split_block_open(inner)?;
-    path.ok_or_else(|| ConfigError::Msg("location needs a path".into()))
-        .map(|p| (p, stmts))
+    let (open, stmts) = split_block_open(inner)?;
+    let BlockOpen::Named(header) = open else {
+        return Err(ConfigError::Msg("location needs a path".into()));
+    };
+    if header.from_local {
+        return Err(ConfigError::Msg("location path cannot use from local".into()));
+    }
+    Ok((header.primary, stmts))
 }
 
 fn arg_to_string(pair: pest::iterators::Pair<'_, Rule>) -> String {

@@ -4,8 +4,10 @@ COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
 file = { SOI ~ statement* ~ EOI }
 statement = { directive | block }
 
+plugin_source = { "from" ~ "local" }
+block_header = { arg ~ plugin_source? }
 block = { ident ~ block_open ~ statement* ~ "}" }
-block_open = { "{" | (arg ~ "{") }
+block_open = { "{" | (block_header ~ "{") }
 directive = { ident ~ arg* ~ ";" }
 
 arg = { string | token }
@@ -13,4 +15,4 @@ string = ${ "\"" ~ inner ~ "\"" }
 inner = @{ (!"\"" ~ ANY)* }
 token = @{ (ASCII_ALPHANUMERIC | "_" | "." | "/" | ":" | "-" | "$")+ }
 
-ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | "-")* }

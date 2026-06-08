@@ -1,0 +1,34 @@
+// qwewginx plugin host contract v1 — see doc/plugins.md (private until feature 16 ships).
+
+package qwewginx:plugin@1;
+
+interface host {
+    /// structured log via tracing on the host.
+    log-info: func(msg: string);
+    log-warn: func(msg: string);
+
+    /// worker → master event bus (json payload v1).
+    bus-emit: func(event: string);
+
+    /// serialized plugin config block from qwewginx.conf (json).
+    get-config-json: func() -> string;
+}
+
+world plugin {
+    import host;
+
+    /// validate plugin-specific config semantics before activation (master only).
+    export validate-config: func() -> result<_, string>;
+
+    /// after load on master — subscribe to bus, bind master-scoped http if declared.
+    export on-master-init: func();
+
+    /// after load on worker — register request hooks.
+    export on-worker-init: func();
+
+    /// per finished request when manifest declares request_hook (worker only).
+    export on-request-complete: func(payload-json: string);
+
+    /// handle routed http when manifest declares http_endpoint.
+    export handle-http: func(method: string, path: string, body: string) -> tuple<u16, string>;
+}

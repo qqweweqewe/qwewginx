@@ -1,9 +1,36 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Plugins {
+    pub registry: Option<String>,
+    pub entries: Vec<PluginEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub name: String,
+    pub version: String,
+    pub source: PluginSource,
+    pub directives: Vec<PluginDirective>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSource {
+    Curated,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDirective {
+    pub name: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub worker_processes: u32,
+    pub plugins: Plugins,
     pub events: Events,
     pub stream: Stream,
     pub http: Http,
