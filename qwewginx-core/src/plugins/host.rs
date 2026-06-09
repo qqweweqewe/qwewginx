@@ -19,6 +19,7 @@ pub struct PluginManifest {
     pub capabilities: PluginCapabilities,
 }
 
+/// Cache path helpers (runtime loading uses [`super::runtime`]).
 pub struct PluginHost {
     cache_root: PathBuf,
     plugins: Plugins,
@@ -37,9 +38,7 @@ impl PluginHost {
     }
 
     pub fn cache_dir_for(&self, entry: &PluginEntry) -> PathBuf {
-        self.cache_root
-            .join(&entry.name)
-            .join(&entry.version)
+        self.cache_root.join(&entry.name).join(&entry.version)
     }
 
     pub fn wasm_path_for(&self, entry: &PluginEntry) -> PathBuf {
@@ -48,23 +47,5 @@ impl PluginHost {
 
     pub fn manifest_path_for(&self, entry: &PluginEntry) -> PathBuf {
         self.cache_dir_for(entry).join("manifest.json")
-    }
-
-    pub fn master_init_all(&self) -> Result<(), String> {
-        for entry in &self.plugins.entries {
-            let wasm = self.wasm_path_for(entry);
-            if !wasm.is_file() {
-                return Err(format!(
-                    "plugin {}@{}: missing {}",
-                    entry.name,
-                    entry.version,
-                    wasm.display()
-                ));
-            }
-            let _manifest = self.manifest_path_for(entry);
-            // TODO(feature-16): wasmtime load, validate_config, on_master_init
-            let _ = wasm.as_path();
-        }
-        Ok(())
     }
 }

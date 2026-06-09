@@ -1,6 +1,6 @@
 // qwewginx plugin host contract v1 — see doc/plugins.md (private until feature 16 ships).
 
-package qwewginx:plugin@1;
+package qwewginx:plugin;
 
 interface host {
     /// structured log via tracing on the host.

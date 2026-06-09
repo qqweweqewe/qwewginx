@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, ValueEnum};
 use qwewginx_core::config::Config;
+use qwewginx_core::plugins::{plugin_cache_root, spawn_master_http, PluginMaster};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -93,25 +95,56 @@ fn run_worker(cfg: Config) -> anyhow::Result<()> {
 }
 
 fn run_master(config_path: &PathBuf, log_level: LogLevel, cfg: Config) -> anyhow::Result<()> {
+    let cache = plugin_cache_root();
+    let mut plugin_master = PluginMaster::load(&cfg.plugins, &cache)
+        .map_err(|e| anyhow::anyhow!("plugin load: {e}"))?;
+    if !cfg.plugins.entries.is_empty() {
+        plugin_master
+            .validate_and_init()
+            .map_err(|e| anyhow::anyhow!("plugin init: {e}"))?;
+        info!(
+            "plugins loaded: {}",
+            cfg.plugins
+                .entries
+                .iter()
+                .map(|e| format!("{}@{}", e.name, e.version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let n = cfg.worker_processes.max(1);
     let exe = std::env::current_exe()?;
     info!("master {} spawning {n} workers", std::process::id());
 
     let mut children: Vec<Child> = Vec::new();
     for _ in 0..n {
-        let child = Command::new(&exe)
-            .arg("--worker")
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--worker")
             .arg("-c")
             .arg(config_path)
             .arg("--log-level")
-            .arg(log_level.filter_str())
-            .spawn()?;
+            .arg(log_level.filter_str());
+        cmd.env("QWEWNGINX_PLUGIN_CACHE", &cache);
+        let child = cmd.spawn()?;
         children.push(child);
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+
+    let shared_master = Arc::new(Mutex::new(plugin_master));
+    let routes: Vec<_> = shared_master
+        .lock()
+        .map_err(|e| anyhow::anyhow!("plugin master lock: {e}"))?
+        .master_http_routes()
+        .to_vec();
+    if !routes.is_empty() {
+        rt.block_on(spawn_master_http(routes, Arc::clone(&shared_master)))
+            .map_err(|e| anyhow::anyhow!("plugin master http: {e}"))?;
+    }
+
     rt.block_on(wait_shutdown_signal());
 
     info!("stopping workers");

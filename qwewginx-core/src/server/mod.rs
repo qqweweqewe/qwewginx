@@ -24,6 +24,7 @@ use hyper_util::server::conn::auto;
 pub use error::ServerError;
 
 use crate::config::{Config, Location, LocationAction, ProxyTarget, ReturnDirective, Server};
+use crate::plugins::SharedPluginWorker;
 use access_log::{
     content_length_from_headers, resolve_access_log_path, response_body_bytes, write_entry,
     AccessLog, AccessLogEntry,
@@ -33,9 +34,21 @@ use proxy::{ProxyResult, ResponseBody, UpstreamMeta, WorkerHttp};
 struct ServerCtx {
     server: Server,
     access_log: Option<Arc<AccessLog>>,
+    plugin_hooks: Option<SharedPluginWorker>,
 }
 
 pub async fn run(cfg: Config) -> Result<(), ServerError> {
+    let plugin_hooks = if cfg.plugins.entries.is_empty() {
+        None
+    } else {
+        let cache = crate::plugins::plugin_cache_root();
+        let hooks = crate::plugins::PluginWorkerRuntime::load(&cfg.plugins, &cache)
+            .map_err(|e| ServerError::Msg(format!("plugin worker load: {e}")))?;
+        hooks
+            .worker_init()
+            .map_err(|e| ServerError::Msg(format!("plugin worker init: {e}")))?;
+        Some(Arc::new(hooks))
+    };
     let conn_builder = auto::Builder::new(TokioExecutor::new());
     let http_ctx = proxy::worker_http_arc(&cfg.http);
     health_probe::spawn(&cfg.http, Arc::clone(&http_ctx));
@@ -49,6 +62,7 @@ pub async fn run(cfg: Config) -> Result<(), ServerError> {
         let srv = Arc::new(ServerCtx {
             server: server.clone(),
             access_log,
+            plugin_hooks: plugin_hooks.clone(),
         });
         let tls_acceptor = match &server.tls {
             Some(files) => Some(tls::TlsAcceptorHandle::load(&files.cert, &files.key)?),
@@ -158,13 +172,14 @@ async fn handle(
 
     let handled = dispatch(req, &ctx.server, http_ctx).await;
 
+    let status = handled.response.status().as_u16();
+    let body_bytes = response_body_bytes(
+        status,
+        content_length_from_headers(handled.response.headers()),
+        handled.body_fallback,
+    );
+
     if let Some(log) = &ctx.access_log {
-        let status = handled.response.status().as_u16();
-        let body_bytes = response_body_bytes(
-            status,
-            content_length_from_headers(handled.response.headers()),
-            handled.body_fallback,
-        );
         write_entry(
             log,
             AccessLogEntry {
@@ -180,7 +195,47 @@ async fn handle(
         );
     }
 
+    if let Some(hooks) = &ctx.plugin_hooks {
+        let payload = plugin_request_payload_json(
+            remote_addr,
+            &method,
+            &uri,
+            status,
+            body_bytes,
+            started,
+            &handled.upstream,
+        );
+        hooks.on_request_complete(&payload);
+    }
+
     handled.response
+}
+
+fn plugin_request_payload_json(
+    remote_addr: Option<SocketAddr>,
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+    status: u16,
+    body_bytes: u64,
+    started: Instant,
+    upstream: &UpstreamMeta,
+) -> String {
+    let upstream_label = match (&upstream.upstream_name, upstream.upstream_addr) {
+        (Some(name), Some(addr)) => format!("{name}:{addr}"),
+        (None, Some(addr)) => addr.to_string(),
+        _ => "-".into(),
+    };
+    serde_json::json!({
+        "remote_addr": remote_addr.map(|a| a.to_string()),
+        "method": method.as_str(),
+        "path": uri.path(),
+        "status": status,
+        "body_bytes": body_bytes,
+        "request_time_ms": started.elapsed().as_millis(),
+        "upstream": upstream_label,
+        "upstream_status": upstream.upstream_status,
+    })
+    .to_string()
 }
 
 async fn dispatch(req: Request<Incoming>, server: &Server, http_ctx: &WorkerHttp) -> Handled {

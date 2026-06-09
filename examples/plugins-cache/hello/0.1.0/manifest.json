@@ -1,0 +1,15 @@
+{
+  "name": "hello",
+  "version": "0.1.0",
+  "api_version": 1,
+  "sha256": "8ab5ab4263396063ecf603b0bb0eb9ac9bbcf9ab07cf76448bbb364a04553a82",
+  "min_qwewginx": "0.1.0",
+  "capabilities": [
+    "request_hook",
+    "master_bus",
+    "http_endpoint"
+  ],
+  "http_endpoint": {
+    "scope": "master"
+  }
+}
